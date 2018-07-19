@@ -268,6 +268,8 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 			return shim.Error(msg)
 		}
 
+		logger.Debugf("json: %s", string(bytes))
+
 		var out jsonDataType
 		err = json.Unmarshal(bytes, &out)
 		if err != nil {
