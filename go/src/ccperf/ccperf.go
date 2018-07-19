@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"net/http"
@@ -58,6 +59,8 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return ccperf.runGetState(stub, args)
 	case "mix":
 		return ccperf.runMix(stub, args)
+	case "json":
+		return ccperf.runJSON(stub, args)
 	case "invoke_chaincode":
 		return ccperf.runInvokeChaincode(stub, args)
 	case "floating_point":
@@ -207,6 +210,71 @@ func (ccperf *CCPerf) runMix(stub shim.ChaincodeStubInterface, args []string) pb
 		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 4, recieved %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
+	}
+
+	getArgs := []string{args[0], args[3], args[2]}
+	res := ccperf.runGetState(stub, getArgs)
+	if res.GetStatus() != 200 {
+		return res
+	}
+
+	putArgs := []string{args[0], args[1], args[2]}
+	return ccperf.runPutState(stub, putArgs)
+}
+
+type jsonDataType struct {
+	data1  string  `json:"data1"`
+	data2  string  `json:"data2"`
+	data3  string  `json:"data3"`
+	data4  string  `json:"data4"`
+	data5  float64 `json:"data5"`
+	data6  float64 `json:"data6"`
+	data7  float64 `json:"data7"`
+	data8  int     `json:"data8"`
+	data9  int     `json:"data9"`
+	data10 int     `json:"data10"`
+}
+
+func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 4 {
+		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 4, recieved %d", len(args))
+		logger.Error(msg)
+		return shim.Error(msg)
+	}
+
+	jsonData := jsonDataType{
+		data1:  "123456",
+		data2:  "abcdefg",
+		data3:  "XYZ",
+		data4:  "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+		data5:  1.23,
+		data6:  9.99,
+		data7:  777.0,
+		data8:  123,
+		data9:  999,
+		data10: -123,
+	}
+
+	num, err := strconv.Atoi(args[0])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+	for i := 0; i < num; i++ {
+		bytes, err := json.Marshal(&jsonData)
+		if err != nil {
+			msg := fmt.Sprintf("Failed to marshall JSON data")
+			logger.Error(msg)
+			return shim.Error(msg)
+		}
+
+		var out jsonDataType
+		err = json.Unmarshal(bytes, &out)
+		if err != nil {
+			msg := fmt.Sprintf("Failed to unmarshall JSON data")
+			logger.Error(msg)
+			return shim.Error(msg)
+		}
 	}
 
 	getArgs := []string{args[0], args[3], args[2]}
