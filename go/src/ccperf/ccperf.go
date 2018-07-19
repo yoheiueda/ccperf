@@ -223,16 +223,16 @@ func (ccperf *CCPerf) runMix(stub shim.ChaincodeStubInterface, args []string) pb
 }
 
 type jsonDataType struct {
-	data1  string  `json:"data1"`
-	data2  string  `json:"data2"`
-	data3  string  `json:"data3"`
-	data4  string  `json:"data4"`
-	data5  float64 `json:"data5"`
-	data6  float64 `json:"data6"`
-	data7  float64 `json:"data7"`
-	data8  int     `json:"data8"`
-	data9  int     `json:"data9"`
-	data10 int     `json:"data10"`
+	Data1  string  `json:"data1"`
+	Data2  string  `json:"data2"`
+	Data3  string  `json:"data3"`
+	Data4  string  `json:"data4"`
+	Data5  float64 `json:"data5"`
+	Data6  float64 `json:"data6"`
+	Data7  float64 `json:"data7"`
+	Data8  int     `json:"data8"`
+	Data9  int     `json:"data9"`
+	Data10 int     `json:"data10"`
 }
 
 func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) pb.Response {
@@ -243,16 +243,16 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 	}
 
 	jsonData := jsonDataType{
-		data1:  "123456",
-		data2:  "abcdefg",
-		data3:  "XYZ",
-		data4:  "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-		data5:  1.23,
-		data6:  9.99,
-		data7:  777.0,
-		data8:  123,
-		data9:  999,
-		data10: -123,
+		Data1:  "123456",
+		Data2:  "abcdefg",
+		Data3:  "XYZ",
+		Data4:  "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+		Data5:  1.23,
+		Data6:  9.99,
+		Data7:  777.0,
+		Data8:  123,
+		Data9:  999,
+		Data10: -123,
 	}
 
 	num, err := strconv.Atoi(args[0])
@@ -261,7 +261,7 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 		return shim.Error(err.Error())
 	}
 	for i := 0; i < num; i++ {
-		bytes, err := json.Marshal(&jsonData)
+		bytes, err := json.Marshal(jsonData)
 		if err != nil {
 			msg := fmt.Sprintf("Failed to marshall JSON data")
 			logger.Error(msg)
