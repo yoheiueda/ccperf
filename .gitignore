@@ -1,0 +1,4 @@
+/go/
+!/go/src/ccperf/
+/node_modules/
+/package-lock.json

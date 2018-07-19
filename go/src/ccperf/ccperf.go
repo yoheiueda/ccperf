@@ -154,7 +154,7 @@ func (ccperf *CCPerf) runPutState(stub shim.ChaincodeStubInterface, args []strin
 
 func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 1, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 3, recieved %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -173,18 +173,18 @@ func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []strin
 
 	base := 0
 	flag := false
-	s := strings.Split(args[3], "_")
+	s := strings.Split(args[2], "_")
 	if len(s) == 6 {
 		x1, err1 := strconv.Atoi(s[3])
 		x2, err2 := strconv.Atoi(s[4])
 		x3, err3 := strconv.Atoi(s[5])
-		if err1 != nil && err2 != nil && err3 != nil {
+		if err1 == nil && err2 == nil && err3 == nil {
 			base = 1000151*x1 + 100207*x2 + 3001*x3
 			flag = true
 		}
 	}
 	if !flag {
-		msg := fmt.Sprintf("Invalid key format: %s", args[3])
+		msg := fmt.Sprintf("Invalid key format: %s", args[2])
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -204,19 +204,19 @@ func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []strin
 
 func (ccperf *CCPerf) runMix(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 4 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 1, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 4, recieved %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
 
-	getArgs := []string{args[0], args[1], args[3]}
+	getArgs := []string{args[0], args[3], args[2]}
 	res := ccperf.runGetState(stub, getArgs)
 	if res.GetStatus() != 200 {
 		return res
 	}
 
 	putArgs := []string{args[0], args[1], args[2]}
-	return ccperf.runGetState(stub, putArgs)
+	return ccperf.runPutState(stub, putArgs)
 }
 
 func (ccperf *CCPerf) runInvokeChaincode(stub shim.ChaincodeStubInterface, args []string) pb.Response {
