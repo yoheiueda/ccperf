@@ -1,4 +1,14 @@
 /go/
 !/go/src/ccperf/
 /node_modules/
-/package-lock.json
+bin
+core.yaml
+crypto-config
+*.block
+go/src/github.com/hyperledger
+go/pkg
+*.block
+*.tx
+*.json
+*.yaml
+!/package.json
