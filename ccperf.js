@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const sdk = require('fabric-client');
 const sprintf = require('sprintf-js').sprintf;
+const yaml = require('js-yaml');
 
 const logger = require('winston');
 if (process.env.FABRIC_CONFIG_LOGLEVEL) {
@@ -37,7 +38,7 @@ class MemoryKeyValueStore {
    }
 }
 
-async function getClient(profile) {
+async function getClient(profile, orgName) {
     const cryptoSuite = sdk.newCryptoSuite();
     const cryptoKeyStore = sdk.newCryptoKeyStore(MemoryKeyValueStore, {})
     cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
@@ -49,13 +50,14 @@ async function getClient(profile) {
     const newStore = await new MemoryKeyValueStore();
     client.setStateStore(newStore);
 
-    const mspid = client.getMspid();
-    org = client._network_config.getOrganizationByMspId(mspid);
+    const config = yaml.safeLoad(loadFile(profile));
+
+    const org = config.organizations[orgName];
 
     const userOpts = {
         username: "admin",
-        mspid: mspid,
-        cryptoContent: {signedCertPEM: org.getAdminCert(), privateKeyPEM: org.getAdminPrivateKey()},
+        mspid: org.mspid,
+        cryptoContent: {signedCertPEM: loadFile(org.signedCert.path), privateKeyPEM: loadFile(org.adminPrivateKey.path)},
         skipPersistence: false
     };
 
@@ -77,7 +79,7 @@ function percentile(list, percent) {
     if (list.length == 0) {
         return 0.0;
     }
-    list.sort();
+    list.sort((a,b) => a - b);
     nth = roundDown(list.length * percent, 1);
     return list[nth];
 }
@@ -93,32 +95,32 @@ function average(list) {
     return sum / list.length;
 }
 
-async function master(profile, processes, duration, interval, type, num, size, population) {
+async function master(profile, logdir, processes, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population) {
     const cwd1 = process.cwd();
-    const client = await getClient(profile)
+    const client = await getClient(profile, orgName)
     const channel = client.getChannel()
 
-    const peer_name = channel.getPeers()[0].getName();
-    const eventhub = channel.getChannelEventHub(peer_name);
-    eventhub.connect(false);
-
     if (population) {
+        const peer_name = channel.getPeers()[0].getName();
+        const eventhub = channel.getChannelEventHub(peer_name);
+        eventhub.connect(false);
+
         const tx_id = client.newTransactionID();
 
         p = new Promise(resolve => eventhub.registerTxEvent(tx_id.getTransactionID(),
                                                             (txId, code, block_bumber) => resolve(txId),
                                                             err => console.error('EventHub error ', err),
                                                             {unregister:true}));
-        
+
         const request = {
             chaincodeId : 'ccperf',
             fcn: 'populate',
             args: ['0', String(population), String(size)],
             txId: tx_id
         };
-    
+
         const results = await channel.sendTransactionProposal(request);
-    
+
         const proposalResponses = results[0];
         const proposal = results[1];
         const orderer_request = {
@@ -126,18 +128,31 @@ async function master(profile, processes, duration, interval, type, num, size, p
             proposalResponses: proposalResponses,
             proposal: proposal
         };
-        
-        await channel.sendTransaction(orderer_request);    
+
+        await channel.sendTransaction(orderer_request);
 
         await p;
+        eventhub.disconnect();
     }
-
-    const blockTable = {}
 
     const start = Date.now() + 5000;
     let prev_t = 0;
 
-    const blockRegNum = eventhub.registerBlockEvent(
+    const blockTable = {};
+    let blockRegNum;
+    let eventhub;
+    let blocksLog;
+    let blocksLogFirst = true;
+    if (committingPeerName) {
+        if (logdir) {
+            const blocksLogPath = logdir + '/blocks.json';
+            blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
+            blocksLog.write('[\n');
+        }
+
+        eventhub = channel.getChannelEventHub(committingPeerName);
+        eventhub.connect(false);
+        blockRegNum = eventhub.registerBlockEvent(
         (block) => {
             // Example data structure of a filtered block:
             // {
@@ -154,7 +169,8 @@ async function master(profile, processes, duration, interval, type, num, size, p
             //       }
             //     }, ...]
             //  }
-            const now = Date.now();
+                const date = new Date();
+                const now = date.getTime();
             if (prev_t == 0) {
                 prev_t = start;
                 return;
@@ -177,12 +193,23 @@ async function master(profile, processes, duration, interval, type, num, size, p
             const count = block.filtered_transactions.length;
             const tps = count / (now - prev_t) * 1000;
             console.error(sprintf('Block %d contains %d transaction(s). TPS is %.2f', block.number, count, tps));
+
+                if (logdir) {
+                    if (blocksLogFirst) {
+                        blocksLogFirst = false;
+                    } else {
+                        blocksLog.write(',\n');
+                    }
+                    blocksLog.write(JSON.stringify({ timestamp: date, block: block}, undefined, 4));
+                }
+
             prev_t = now;
         },
         (err) => {
             console.error('EventHub error ', err);
         }
     );
+    }
 
     const cwd2 = process.cwd();
     process.chdir(cwd1);
@@ -200,7 +227,7 @@ async function master(profile, processes, duration, interval, type, num, size, p
     for (var i = 0; i < processes; i++) {
         const delay = i*interval/processes;
         cluster.setupMaster({
-            args: [profile, start, duration, interval, delay, type, num, size, population]
+            args: [profile, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population]
         });
     
         const w = cluster.fork();
@@ -217,11 +244,28 @@ async function master(profile, processes, duration, interval, type, num, size, p
     // height = Number(info.height)
     // block = await channel.queryBlock(height-1);
 
+    if (committingPeerName) {
     eventhub.unregisterBlockEvent(blockRegNum);
     eventhub.disconnect();
+        if (logdir) {
+            blocksLog.write('\n]\n');
+            blocksLog.close();
+        }
+    }
 
-    let min_t1 = Number.MAX_VALUE;
-    let max_t4 = 0;
+    let min_t = Number.MAX_VALUE;
+    let max_t = 0;
+    for (const txid in txTable) {
+        const tx = txTable[txid];
+        const [t1, t2, t3] = tx;
+        if (t1 < min_t) {
+            min_t = t1;
+        }
+        if (t3 > max_t) {
+            max_t = t3;
+        }
+    }
+
     for (const num in blockTable) {
         const t4 = blockTable[num].timestamp;
         for (const txType in blockTable[num].txset) {
@@ -229,25 +273,21 @@ async function master(profile, processes, duration, interval, type, num, size, p
                 for (const txid of blockTable[num].txset[txType][code]) {
                     tx = txTable[txid];
                     if (tx !== undefined) {
-                        const [t1, t2, t3] = tx;
                         tx.push(t4);
-                        if (t1 < min_t1) {
-                            min_t1 = t1;
+                        if (t4 > max_t) {
+                            max_t = t4;
                         }
-                        if (t4 > max_t4) {
-                            max_t4 = t4;
                         }
                     }
                 }
             }
         }
-    }
 
     const period = 5000;
 
-    min_t1 = roundDown(min_t1, period);
-    max_t4 = roundUp(max_t4, period);
-    const elapsed = max_t4 - min_t1;
+    min_t = roundDown(min_t, period);
+    max_t = roundUp(max_t, period);
+    const elapsed = max_t - min_t;
 
     const latencies = [];
 
@@ -259,7 +299,7 @@ async function master(profile, processes, duration, interval, type, num, size, p
         });
     }
 
-    const begin = min_t1;
+    const begin = min_t;
 
     for (const txid in txTable) {
         const tx = txTable[txid];
@@ -312,25 +352,40 @@ async function execute(info) {
     const client = info.client;
     const channel = info.channel;
     const txStats = info.txStats;
-    info.index += 1;
 
     const tx_id = client.newTransactionID();
 
     const request = {
+        targets: info.peers,
         chaincodeId : 'ccperf',
         fcn: info.type,
         args: info.genArgs(info),
         txId: tx_id
     };
+    if (info.genTransientMap) {
+        request.transientMap = info.genTransientMap(info);
+    }
 
-    const t1 = Date.now();
+    const t1 = new Date();
 
     const results = await channel.sendTransactionProposal(request);
 
-    const t2 = Date.now();
+    const t2 = new Date();
 
     const proposalResponses = results[0];
+
+    if (proposalResponses.length == 0) {
+        console.error('Endorsement failure: Proposal response is empty');
+        return;
+    }
+    if (! proposalResponses.reduce((ok, res) => ok && res.response && res.response.status == 200, true)) {
+        const res = proposalResponses.filter(res => !res.response || res.response.status != 200)[0];
+        console.error('Endorsement failure: ' + res.message);
+        return;
+    }
+   
     const proposal = results[1];
+
     const orderer_request = {
         txId: tx_id,
         proposalResponses: proposalResponses,
@@ -339,43 +394,93 @@ async function execute(info) {
     
     orderer_results = await channel.sendTransaction(orderer_request);
 
-    const t3 = Date.now();
+    const t3 = new Date();
 
-    txStats[tx_id.getTransactionID()] = [t1, t2, t3];
+    txStats[tx_id.getTransactionID()] = [t1.getTime(), t2.getTime(), t3.getTime()];
+    if (info.requestsLog) {
+        if (info.index > 0) {
+            info.requestsLog.write(',\n');
+        }
+        info.requestsLog.write(JSON.stringify({ txid: tx_id.getTransactionID(), peer: [{ submission: t1, response: t2}], orderer: { submission: t2, response: t3} }, undefined, 4));
+    }
+
+    info.index += 1;
 }
 
-async function worker(profile, start, duration, interval, delay, type, num, size, population) {
-    const client = await getClient(profile);
+async function worker(profile, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population) {
+    const client = await getClient(profile, orgName);
+    const peers = [client.getPeer(endorsingPeerName)];
     const channel = client.getChannel();
     const txStats = {};
     const genArgs = handlerTable[type].genArgs;
+    const genTransientMap = handlerTable[type].genTransientMap;
+
+    if (logdir == 'undefined') {
+        logdir = undefined;
+    }
+    let requestsLog;
+    if (logdir) {
+        const requestsLogPath = logdir + '/requests-' + cluster.worker.id + '.json';
+        requestsLog = fs.createWriteStream(requestsLogPath, { flags: 'wx' });
+        requestsLog.write('[\n');
+    }
+
     const info = {
         client: client,
         channel: channel,
+        peers: peers,
         txStats: txStats,
         workerID: cluster.worker.id,
         type: type,
         num: num,
         size: size,
         population: population,
-        index: 1,
-        genArgs: genArgs
+        index: 0,
+        genArgs: genArgs,
+        requestsLog: requestsLog
     };
+
+    if (genTransientMap) {
+        info.genTransientMap = genTransientMap;
+    }
 
     const wait = start + delay - Date.now();
     if (wait > 0) {
         await sleep(wait);
     }
 
-    const timeout = setInterval(execute, interval, info);
+    //const timeout = setInterval(execute, interval, info);
+    //await sleep(duration);
+    //clearInterval(timeout);
 
-    await sleep(duration);
+    const end = Date.now() + duration;
+    let behind = 0;
+    while (true) {
+        const before = Date.now();
+        execute(info);
+        const after = Date.now();
+        const remaining = interval - (after - before) - behind;
+        if (remaining > 0) {
+            behind = 0;
+            await sleep(remaining);
+        } else {
+            behind = -remaining;
+        }
+        if (Date.now() > end) {
+            break;
+        }
+    }
 
-    clearInterval(timeout);
+    //console.log(info.index/duration*1000);
 
     await new Promise(resolve => {
         process.send(txStats, null, {}, resolve);
     });
+
+    if (logdir) {
+        requestsLog.write('\n]\n');
+        requestsLog.close();
+    }
 
     process.exit(0); // Forces to close all connections
 }
@@ -386,8 +491,12 @@ function sleep(msec) {
 
 async function run(cmd) {
     const profile = cmd.profile;
+    const logdir = cmd.logdir;
     const processes = cmd.processes;
     const target = cmd.target;
+    const orgName = cmd.org;
+    const endorsingPeerName = cmd.endorsingPeer;
+    const committingPeerName = cmd.committingPeer;
     const type = cmd.type;
     const num = cmd.num;
     const size = cmd.size;
@@ -397,28 +506,32 @@ async function run(cmd) {
 
     const tps = target / processes;
     const interval = 1000.0 / tps
-
-    await master(profile, processes, duration, interval, type, num, size, population);
+    //console.log('interval=%f', interval);
+    await master(profile, logdir, processes, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population);
 
 }
 
 function main() {
 
     if (! cluster.isMaster) {
-        const [profile, start, duration, interval, delay, type, num, size, population] = process.argv.slice(2);
-        worker(profile, Number(start), Number(duration), Number(interval), Number(delay), type, Number(num), Number(size), Number(population));
+        const [profile, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population] = process.argv.slice(2);
+        worker(profile, logdir, Number(start), Number(duration), Number(interval), Number(delay), orgName, endorsingPeerName, type, num, size, population);
         return;
     }
     
     program.command('run')
+        .option('--logdir [dir]', "Directory name where log files are stored")
         .option('--processes [number]', "Number of processes to be launched")
         .option('--profile [path]',     "Connection profile")
         .option('--target [number]',    "Target input TPS")
         .option('--duration [number]',    "Duration in second")
+        .option('--org [string]', "Organization name")
         .option('--type [string]',   "Type of workload (eg. putstate)")
         .option('--num [number]',    "Number of operations per transaction")
         .option('--size [bytes]',    "Payload size of a PutState call")
         .option('--population [number]',    "Number of prepopulated key-values")
+        .option('--endorsing-peer [name]', "Peer name to which transaction proposals are sent")
+        .option('--committing-peer [name]', "Peer name whose commit events are monitored ")
         .action(run);
     program.parse(process.argv);
 }
