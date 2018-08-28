@@ -1,0 +1,80 @@
+
+Profiles:
+    OrdererGenesis:
+        Policies: &DefaultPolicies
+            Readers:
+                Type: ImplicitMeta
+                Rule: "ANY Readers"
+            Writers:
+                Type: ImplicitMeta
+                Rule: "ANY Writers"
+            Admins:
+                Type: ImplicitMeta
+                Rule: "MAJORITY Admins"
+        Capabilities:
+            V1_1: true
+        Orderer:
+            OrdererType: solo
+            Addresses:
+            {%- for orderer in ordererorg.orderers %}
+                - {{ orderer.name }}.{{ ordererorg.domain }}:7050
+            {%- endfor %}
+            BatchTimeout: 1000ms
+            BatchSize:
+                MaxMessageCount: 1000
+                AbsoluteMaxBytes: 98 MB
+                PreferredMaxBytes: 1024 KB
+            Policies:
+                <<: *DefaultPolicies
+            Capabilities:
+                V1_1: true
+            Organizations:
+                -
+                    Name: {{ ordererorg.mspid }}
+                    ID: {{ ordererorg.mspid }}
+                    MSPDir: crypto-config/ordererOrganizations/{{ ordererorg.domain }}/msp
+                    Policies:
+                        Readers:
+                            Type: Signature
+                            Rule: "OR('{{ ordererorg.mspid }}.member')"
+                        Writers:
+                            Type: Signature
+                            Rule: "OR('{{ ordererorg.mspid }}.member')"
+                        Admins:
+                            Type: Signature
+                            Rule: "OR('{{ ordererorg.mspid }}.admin')"
+        Consortiums:
+            MyConsortium:
+                Organizations:
+                {%- for org in orgs %}
+                    - &{{ org.mspid }}
+                        Name: {{ org.mspid }}
+                        ID: {{ org.mspid }}
+                        MSPDir: crypto-config/peerOrganizations/{{ org.domain }}/msp
+                        AnchorPeers:
+                        {%- for peer in org.peers %}
+                            - Host: {{ peer.name }}.{{ org.domain }}
+                              Port: 7051
+                        {%- endfor %}
+                        Policies:
+                            Readers:
+                                Type: Signature
+                                Rule: "OR('{{ org.mspid }}.member')"
+                            Writers:
+                                Type: Signature
+                                Rule: "OR('{{ org.mspid }}.member')"
+                            Admins:
+                                Type: Signature
+                                Rule: "OR('{{ org.mspid }}.admin')"
+                {%- endfor %}
+    MyChannel:
+        Consortium: MyConsortium
+        Application:
+            Policies:
+                <<: *DefaultPolicies
+            Organizations:
+            {%- for org in orgs %}
+                - *{{ org.mspid}}
+            {%- endfor %}
+            Capabilities:
+                V1_2: true

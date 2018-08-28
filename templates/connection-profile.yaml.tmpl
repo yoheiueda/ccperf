@@ -1,0 +1,51 @@
+name: {{ network }}
+version: '1.0'
+
+channels:
+  mychannel:
+    orderers:
+    {%- for orderer in ordererorg.orderers %}
+      - {{ orderer.name }}.{{ ordererorg.domain }}
+    {%- endfor %}
+
+    peers:
+{%- for org in orgs -%}
+{%- for peer in org.peers %}
+      {{ peer.name }}.{{ org.domain }}:
+        endorsingPeer: true
+        chaincodeQuery: true
+        ledgerQuery: true
+        eventSource: true
+{% endfor -%}
+{%- endfor %}
+organizations:
+{%- for org in orgs %}
+  {{ org.name }}:
+    mspid: {{ org.mspid }}
+    peers:
+    {%- for peer in org.peers %}
+      - {{ peer.name }}.{{ org.domain }}
+    {%- endfor %}
+    adminPrivateKey:
+      path: {{ org | findsk }}
+    signedCert:
+      path: crypto-config/peerOrganizations/{{ org.domain }}/users/Admin@{{ org.domain }}/msp/signcerts/Admin@{{ org.domain }}-cert.pem
+{% endfor %}
+orderers:
+{%- for orderer in ordererorg.orderers %}
+  {{ orderer.name }}.{{ ordererorg.domain }}:
+    url: 'grpcs://{{ orderer.host }}:{{ orderer.ports.requests }}'
+    tlsCACerts:
+      path: crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{ orderer.name }}.{{ ordererorg.domain }}/msp/tlscacerts/tlsca.{{ ordererorg.domain }}-cert.pem
+{%- endfor %}
+
+peers:
+{%- for org in orgs %}
+{%- for peer in org.peers %}
+  {{ peer.name }}.{{ org.domain }}:
+    url: 'grpcs://{{ peer.host }}:{{ peer.ports.requests }}'
+    eventUrl: 'grpcs://{{ peer.host }}:{{ peer.ports.events }}'
+    tlsCACerts:
+      path: crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp/tlscacerts/tlsca.{{ org.domain }}-cert.pem
+{% endfor -%}
+{% endfor %}

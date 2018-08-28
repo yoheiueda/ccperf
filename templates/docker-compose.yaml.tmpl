@@ -1,0 +1,83 @@
+version: '2.1'
+
+networks:
+  {{ network }}:
+
+services:
+  {%- for orderer in ordererorg.orderers %}
+  {{ orderer.name }}:
+    container_name: {{ orderer.name }}
+    image: hyperledger/fabric-orderer:${IMAGE_TAG}
+    environment:
+      - ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
+      - ORDERER_GENERAL_LISTENADDRESS=0.0.0.0
+      - ORDERER_GENERAL_LISTENPORT=7050
+      - ORDERER_GENERAL_GENESISMETHOD=file
+      - ORDERER_GENERAL_GENESISFILE=/var/hyperledger/orderer/orderer.genesis.block
+      - ORDERER_GENERAL_LOCALMSPID={{ ordererorg.mspid }}
+      - ORDERER_GENERAL_LOCALMSPDIR=/var/hyperledger/orderer/msp
+      # enabled TLS
+      - ORDERER_GENERAL_TLS_ENABLED=${ORDERER_GENERAL_TLS_ENABLED}
+      - ORDERER_GENERAL_TLS_PRIVATEKEY=/var/hyperledger/orderer/tls/server.key
+      - ORDERER_GENERAL_TLS_CERTIFICATE=/var/hyperledger/orderer/tls/server.crt
+      - ORDERER_GENERAL_TLS_ROOTCAS=[/var/hyperledger/orderer/tls/ca.crt]
+      - ORDERER_GENERAL_PROFILE_ENABLED=true
+    working_dir: /opt/gopath/src/github.com/hyperledger/fabric
+    command: orderer
+    volumes:
+    - ./genesis.block:/var/hyperledger/orderer/orderer.genesis.block
+    - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/msp:/var/hyperledger/orderer/msp
+    - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/tls/:/var/hyperledger/orderer/tls
+    ports:
+      - {{ orderer.ports.requests}}:7050
+      - {{ orderer.ports.pprof}}:6060
+    networks:
+      {{ network }}:
+        aliases:
+          - {{ orderer.name}}.{{ ordererorg.domain }}
+  {%- endfor  %}
+  {%- for org in orgs -%}
+    {%- for peer in org.peers %}
+
+  {{ org.name }}-{{ peer.name }}:
+    container_name: {{ org.name }}-{{ peer.name }}
+    image: hyperledger/fabric-peer:${IMAGE_TAG}
+    environment:
+      - CORE_PEER_ID={{ peer.name }}.{{ org.domain }}
+      - CORE_PEER_LOCALMSPID={{ org.mspid }}
+      - CORE_PEER_ADDRESS={{ peer.name }}.{{ org.domain }}:7051
+      - CORE_PEER_LISTENADDRESS=0.0.0.0:7051
+      - CORE_PEER_EVENTS_ADDRESS=0.0.0.0:7053
+      #- CORE_PEER_GOSSIP_BOOTSTRAP={{ peer.name }}.{{ org.domain }}:7051
+      - CORE_PEER_GOSSIP_EXTERNALENDPOINT={{ peer.name }}.{{ org.domain }}:7051
+      - CORE_PEER_GOSSIP_USELEADERELECTION=false
+      - CORE_PEER_GOSSIP_ORGLEADER=true
+      - CORE_VM_ENDPOINT=unix:///host/var/run/docker.sock
+      - CORE_VM_DOCKER_HOSTCONFIG_NETWORKMODE=${COMPOSE_PROJECT_NAME}_{{ network }}
+      - CORE_LOGGING_LEVEL=${CORE_LOGGING_LEVEL}
+      #- CORE_LOGGING_CAUTHDSL=DEBUG
+      #- CORE_LOGGING_MSP=DEBUG
+      #- CORE_LOGGING_POLICIES=DEBUG
+      - CORE_CHAINCODE_LOGGING_LEVEL=${CORE_CHAINCODE_LOGGING_LEVEL}
+      #- CORE_CHAINCODE_LOGGING_SHIM=DEBUG
+      - CORE_PEER_TLS_ENABLED=${CORE_PEER_TLS_ENABLED}
+      - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
+      - CORE_PEER_TLS_KEY_FILE=/etc/hyperledger/fabric/tls/server.key
+      - CORE_PEER_TLS_ROOTCERT_FILE=/etc/hyperledger/fabric/tls/ca.crt
+      - CORE_PEER_PROFILE_ENABLED=true
+    working_dir: /opt/gopath/src/github.com/hyperledger/fabric/peer
+    command: peer node start
+    volumes:
+        - /var/run/:/host/var/run/
+        - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp:/etc/hyperledger/fabric/msp
+        - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/tls:/etc/hyperledger/fabric/tls
+    ports:
+      - {{ peer.ports.requests }}:7051
+      - {{ peer.ports.events }}:7053
+      - {{ peer.ports.pprof }}:6060
+    networks:
+      {{ network }}:
+        aliases:
+          - {{ peer.name }}.{{ org.domain }}
+    {%- endfor %}
+  {%- endfor %}

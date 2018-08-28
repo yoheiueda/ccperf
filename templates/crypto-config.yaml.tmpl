@@ -1,0 +1,25 @@
+OrdererOrgs:
+  - Name: {{ ordererorg.name }}
+    Domain: {{ ordererorg.domain }}
+    Specs:
+      {%- for orderer in ordererorg.orderers %}
+      - Hostname: {{ orderer.name }}
+        SANS:
+          - localhost
+          - "127.0.0.1"
+      {% endfor %}
+PeerOrgs:
+{%- for org in orgs %}
+  - Name: {{ org.mspid }}
+    Domain: {{ org.domain }}
+    EnableNodeOUs: true
+    Specs:
+    {%- for peer in org.peers %}
+      - Hostname: {{ peer.name }}
+        SANS:
+          - localhost
+          - "127.0.0.1"
+    Users:
+      Count: 1
+    {% endfor %}
+{%- endfor -%}
