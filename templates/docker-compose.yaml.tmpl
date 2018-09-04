@@ -7,7 +7,7 @@ services:
   {%- for orderer in ordererorg.orderers %}
   {{ orderer.name }}:
     container_name: {{ orderer.name }}
-    image: hyperledger/fabric-orderer:${IMAGE_TAG}
+    image: hyperledger/fabric-orderer:${FABRIC_TAG}
     environment:
       - ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
       - ORDERER_GENERAL_LISTENADDRESS=0.0.0.0
@@ -25,9 +25,12 @@ services:
     working_dir: /opt/gopath/src/github.com/hyperledger/fabric
     command: orderer
     volumes:
-    - ./genesis.block:/var/hyperledger/orderer/orderer.genesis.block
-    - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/msp:/var/hyperledger/orderer/msp
-    - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/tls/:/var/hyperledger/orderer/tls
+      {%- if orderer.volume %}
+      - {{ orderer.volume }}:/var/hyperledger/production
+      {%- endif %}
+      - ./genesis.block:/var/hyperledger/orderer/orderer.genesis.block
+      - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/msp:/var/hyperledger/orderer/msp
+      - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/tls/:/var/hyperledger/orderer/tls
     ports:
       - {{ orderer.ports.requests}}:7050
       - {{ orderer.ports.pprof}}:6060
@@ -41,7 +44,7 @@ services:
 
   {{ org.name }}-{{ peer.name }}:
     container_name: {{ org.name }}-{{ peer.name }}
-    image: hyperledger/fabric-peer:${IMAGE_TAG}
+    image: hyperledger/fabric-peer:${FABRIC_TAG}
     environment:
       - CORE_PEER_ID={{ peer.name }}.{{ org.domain }}
       - CORE_PEER_LOCALMSPID={{ org.mspid }}
@@ -60,6 +63,7 @@ services:
       #- CORE_LOGGING_POLICIES=DEBUG
       - CORE_CHAINCODE_LOGGING_LEVEL=${CORE_CHAINCODE_LOGGING_LEVEL}
       #- CORE_CHAINCODE_LOGGING_SHIM=DEBUG
+      - CORE_CHAINCODE_BUILDER=hyperledger/fabric-ccenv:${FABRIC_TAG}
       - CORE_PEER_TLS_ENABLED=${CORE_PEER_TLS_ENABLED}
       - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
       - CORE_PEER_TLS_KEY_FILE=/etc/hyperledger/fabric/tls/server.key
@@ -68,9 +72,12 @@ services:
     working_dir: /opt/gopath/src/github.com/hyperledger/fabric/peer
     command: peer node start
     volumes:
-        - /var/run/:/host/var/run/
-        - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp:/etc/hyperledger/fabric/msp
-        - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/tls:/etc/hyperledger/fabric/tls
+      {%- if peer.volume %}
+      - {{ peer.volume }}:/var/hyperledger/production
+      {%- endif %}
+      - /var/run/:/host/var/run/
+      - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp:/etc/hyperledger/fabric/msp
+      - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/tls:/etc/hyperledger/fabric/tls
     ports:
       - {{ peer.ports.requests }}:7051
       - {{ peer.ports.events }}:7053
