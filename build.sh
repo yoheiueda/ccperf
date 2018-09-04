@@ -17,6 +17,7 @@ cd ./go/src/github.com/hyperledger/fabric
 for t in $targets; do
   rm -f .build/image/"$t"/.dummy-*-*
 done
+rm -f .build/goshim.tar.bz2
 
 make_targets=$(echo $targets | sed 's/\(peer\|orderer\)/\1-docker/g')
 
