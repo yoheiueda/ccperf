@@ -7,6 +7,9 @@ OrdererOrgs:
         SANS:
           - localhost
           - "127.0.0.1"
+          {% if orderer.host != "localhost" -%}
+          - "{{ orderer.host }}"
+          {%- endif %}
       {% endfor %}
 PeerOrgs:
 {%- for org in orgs %}
@@ -19,6 +22,9 @@ PeerOrgs:
         SANS:
           - localhost
           - "127.0.0.1"
+          {% if peer.host != "localhost" -%}
+          - "{{ peer.host }}"
+          {%- endif %}
     Users:
       Count: 1
     {% endfor %}
