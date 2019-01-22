@@ -9,7 +9,11 @@ services:
     container_name: {{ orderer.name }}
     image: hyperledger/fabric-orderer:${FABRIC_TAG}
     environment:
-      - ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
+      #- ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
+      - FABRIC_LOGGING_SPEC=INFO
+      - ORDERER_OPERATIONS_LISTENADDRESS=0.0.0.0:8080
+      - ORDERER_OPERATIONS_TLS_ENABLED=false
+      - ORDERER_METRICS_PROVIDER=prometheus
       - ORDERER_GENERAL_LISTENADDRESS=0.0.0.0
       - ORDERER_GENERAL_LISTENPORT=7050
       - ORDERER_GENERAL_GENESISMETHOD=file
@@ -34,10 +38,16 @@ services:
     ports:
       - {{ orderer.ports.requests}}:7050
       - {{ orderer.ports.pprof}}:6060
+      - 8081:8080
     networks:
       {{ network }}:
         aliases:
           - {{ orderer.name}}.{{ ordererorg.domain }}
+    healthcheck:
+      test: wget -q -O- http://localhost:8080/healthz | grep -q '"status":"OK"'
+      interval: 5s
+      timeout: 5s
+      retries: 0 
   {%- endfor  %}
   {%- for org in orgs -%}
     {%- for peer in org.peers %}
@@ -46,23 +56,20 @@ services:
     container_name: {{ org.name }}-{{ peer.name }}
     image: hyperledger/fabric-peer:${FABRIC_TAG}
     environment:
+      - FABRIC_LOGGING_SPEC=INFO
+      - CORE_OPERATIONS_LISTENADDRESS=0.0.0.0:8080
+      - CORE_OPERATIONS_TLS_ENABLED=false
+      - CORE_METRICS_PROVIDER=prometheus
       - CORE_PEER_ID={{ peer.name }}.{{ org.domain }}
       - CORE_PEER_LOCALMSPID={{ org.mspid }}
       - CORE_PEER_ADDRESS={{ peer.name }}.{{ org.domain }}:7051
       - CORE_PEER_LISTENADDRESS=0.0.0.0:7051
-      - CORE_PEER_EVENTS_ADDRESS=0.0.0.0:7053
       #- CORE_PEER_GOSSIP_BOOTSTRAP={{ peer.name }}.{{ org.domain }}:7051
       - CORE_PEER_GOSSIP_EXTERNALENDPOINT={{ peer.name }}.{{ org.domain }}:7051
       - CORE_PEER_GOSSIP_USELEADERELECTION=false
       - CORE_PEER_GOSSIP_ORGLEADER=true
       - CORE_VM_ENDPOINT=unix:///host/var/run/docker.sock
       - CORE_VM_DOCKER_HOSTCONFIG_NETWORKMODE=${COMPOSE_PROJECT_NAME}_{{ network }}
-      - CORE_LOGGING_LEVEL=${CORE_LOGGING_LEVEL}
-      #- CORE_LOGGING_CAUTHDSL=DEBUG
-      #- CORE_LOGGING_MSP=DEBUG
-      #- CORE_LOGGING_POLICIES=DEBUG
-      - CORE_CHAINCODE_LOGGING_LEVEL=${CORE_CHAINCODE_LOGGING_LEVEL}
-      #- CORE_CHAINCODE_LOGGING_SHIM=DEBUG
       - CORE_CHAINCODE_BUILDER=hyperledger/fabric-ccenv:${FABRIC_TAG}
       - CORE_PEER_TLS_ENABLED=${CORE_PEER_TLS_ENABLED}
       - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
@@ -80,11 +87,58 @@ services:
       - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/tls:/etc/hyperledger/fabric/tls
     ports:
       - {{ peer.ports.requests }}:7051
-      - {{ peer.ports.events }}:7053
       - {{ peer.ports.pprof }}:6060
+      - {{ peer.ports.metrics }}:8080
     networks:
       {{ network }}:
         aliases:
           - {{ peer.name }}.{{ org.domain }}
+    healthcheck:
+      test: wget -q -O- http://localhost:8080/healthz | grep -q '"status":"OK"'
+      interval: 5s
+      timeout: 5s
+      retries: 0
     {%- endfor %}
   {%- endfor %}
+
+  cadvisor:
+    container_name: cadvisor
+    image: google/cadvisor:v0.32.0
+    command: --disable_metrics=""
+    volumes:
+     - /:/rootfs:ro
+     - /var/run:/var/run:rw
+     - /sys:/sys:ro
+     - /var/lib/docker/:/var/lib/docker:ro
+    ports:
+      - 10080:8080
+    networks:
+      {{ network }}:
+
+  prometheus:
+    container_name: prometheus
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - 9090:9090
+    networks:
+      {{ network }}:
+
+  pushgateway:
+    container_name: pushgateway
+    image: prom/pushgateway
+    ports:
+      - 9091:9091
+    networks:
+      {{ network }}:
+
+  grafana:
+    container_name: grafana
+    image: grafana/grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    ports:
+      - 3000:3000
+    networks:
+      {{ network }}:

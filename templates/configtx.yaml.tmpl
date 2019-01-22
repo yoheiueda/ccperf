@@ -12,14 +12,14 @@ Profiles:
                 Type: ImplicitMeta
                 Rule: "MAJORITY Admins"
         Capabilities:
-            V1_1: true
+            V1_3: true
         Orderer:
             OrdererType: solo
             Addresses:
             {%- for orderer in ordererorg.orderers %}
                 - {{ orderer.name }}.{{ ordererorg.domain }}:7050
             {%- endfor %}
-            BatchTimeout: 1000ms
+            BatchTimeout: 100ms
             BatchSize:
                 MaxMessageCount: 1000
                 AbsoluteMaxBytes: 98 MB
@@ -77,4 +77,4 @@ Profiles:
                 - *{{ org.mspid}}
             {%- endfor %}
             Capabilities:
-                V1_2: true
+                V1_3: true

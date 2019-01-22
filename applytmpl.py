@@ -40,7 +40,7 @@ data = {
             'mspid': 'PeerOrg1',
             'domain': 'org1.' + commonDomain,
             'peers': [
-                { 'name': 'peer1', 'ports': { 'requests':7051, 'events':7053, 'pprof':7061 }, 'host': commonHostname },
+                { 'name': 'peer1', 'ports': { 'requests':7051, 'pprof':7061, 'metrics':8080 }, 'host': commonHostname },
             ]
         }
     ]
