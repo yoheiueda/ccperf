@@ -345,6 +345,9 @@ const handlerTable = {
     },
     'mix' : {
         'genArgs': info => [String(info.num), String(info.size), sprintf('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
+    },
+    'json' : {
+        'genArgs': info => [String(info.num), String(info.size), sprintf('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
     }
 }
 
