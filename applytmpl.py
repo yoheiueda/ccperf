@@ -40,10 +40,22 @@ data = {
             'mspid': 'PeerOrg1',
             'domain': 'org1.' + commonDomain,
             'peers': [
-                { 'name': 'peer1', 'ports': { 'requests':7051, 'pprof':7061, 'metrics':8080 }, 'host': commonHostname },
+                { 'name': 'peer1', 'ports': { 'requests':7051, 'pprof':7061 }, 'host': commonHostname },
             ]
         }
-    ]
+    ],
+    'grafana': {
+        'port': 3000
+    },
+    'prometheus': {
+        'port': 9090
+    },
+    'pushgateway': {
+        'port': 9091
+    },
+    'proxy': {
+        'port': 8888
+    }
 }
 
 out = tpl.render(data)

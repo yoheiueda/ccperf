@@ -38,7 +38,6 @@ services:
     ports:
       - {{ orderer.ports.requests}}:7050
       - {{ orderer.ports.pprof}}:6060
-      - 8081:8080
     networks:
       {{ network }}:
         aliases:
@@ -88,7 +87,6 @@ services:
     ports:
       - {{ peer.ports.requests }}:7051
       - {{ peer.ports.pprof }}:6060
-      - {{ peer.ports.metrics }}:8080
     networks:
       {{ network }}:
         aliases:
@@ -110,8 +108,6 @@ services:
      - /var/run:/var/run:rw
      - /sys:/sys:ro
      - /var/lib/docker/:/var/lib/docker:ro
-    ports:
-      - 10080:8080
     networks:
       {{ network }}:
 
@@ -121,7 +117,7 @@ services:
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
     ports:
-      - 9090:9090
+      - {{ prometheus.port }}:9090
     networks:
       {{ network }}:
 
@@ -129,7 +125,7 @@ services:
     container_name: pushgateway
     image: prom/pushgateway
     ports:
-      - 9091:9091
+      - {{ pushgateway.port }}:9091
     networks:
       {{ network }}:
 
@@ -139,7 +135,7 @@ services:
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
     ports:
-      - 3000:3000
+      - {{ grafana.port }}:3000
     networks:
       {{ network }}:
 
@@ -147,6 +143,6 @@ services:
     container_name: tinyproxy
     image: tinyproxy
     ports:
-      - 8888:8888
+      - {{ proxy.port }}:8888
     networks:
       {{ network }}:
