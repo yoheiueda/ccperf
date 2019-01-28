@@ -1,4 +1,4 @@
-version: '2.1'
+version: '3.7'
 
 networks:
   {{ network }}:
@@ -98,6 +98,26 @@ services:
       retries: 0
     {%- endfor %}
   {%- endfor %}
+
+  node-exporter:
+    image: prom/node-exporter
+    container_name: node-exporter
+    pid: host
+    ports:
+      - 9100:9100
+    volumes:
+      - type: bind
+        source: /
+        target: /host
+        read_only: true
+        #bind:
+        #  propagation: rslave
+    command: --path.rootfs /host
+    hostname: ${HOSTNAME}
+    #uts_mode: host
+    #network_mode: host
+    networks:
+      {{ network }}:
 
   cadvisor:
     container_name: cadvisor
