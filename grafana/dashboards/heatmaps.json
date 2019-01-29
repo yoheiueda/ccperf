@@ -15,9 +15,36 @@
     "editable": true,
     "gnetId": null,
     "graphTooltip": 0,
-    "id": null,
-    "links": [],
+    "id": 3,
+    "links": [
+        {
+            "icon": "external link",
+            "tags": [],
+            "type": "dashboards"
+        }
+    ],
     "panels": [
+        {
+            "folderId": null,
+            "gridPos": {
+                "h": 4,
+                "w": 3,
+                "x": 0,
+                "y": 0
+            },
+            "headings": false,
+            "id": 4,
+            "limit": 10,
+            "links": [],
+            "query": "",
+            "recent": false,
+            "search": false,
+            "starred": true,
+            "tags": [],
+            "title": "Dashboards",
+            "transparent": true,
+            "type": "dashlist"
+        },
         {
             "cards": {
                 "cardPadding": null,
@@ -35,7 +62,7 @@
                 "h": 9,
                 "w": 12,
                 "x": 0,
-                "y": 0
+                "y": 4
             },
             "heatmap": {},
             "highlightCards": true,
@@ -117,5 +144,5 @@
     "timezone": "",
     "title": "Heatmaps",
     "uid": "fabric3",
-    "version": 0
+    "version": 1
 }

@@ -15,9 +15,15 @@
   "editable": true,
   "gnetId": null,
   "graphTooltip": 0,
-  "id": 3,
-  "iteration": 1548676945747,
-  "links": [],
+  "id": 1,
+  "iteration": 1548723474956,
+  "links": [
+    {
+      "icon": "external link",
+      "tags": [],
+      "type": "dashboards"
+    }
+  ],
   "panels": [
     {
       "collapsed": false,
@@ -529,6 +535,13 @@
       "pointradius": 5,
       "points": false,
       "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": false,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
       "seriesOverrides": [],
       "spaceLength": 10,
       "stack": false,
@@ -538,7 +551,7 @@
           "expr": "irate(ledger_blockchain_height{channel=~\"$channel\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "blocks ({{ $instance }})",
+          "legendFormat": "blocks ({{ instance }})",
           "refId": "A"
         }
       ],
@@ -613,6 +626,13 @@
       "pointradius": 5,
       "points": false,
       "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": false,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
       "seriesOverrides": [],
       "spaceLength": 10,
       "stack": false,
@@ -704,6 +724,13 @@
       "pointradius": 5,
       "points": false,
       "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": false,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
       "seriesOverrides": [],
       "spaceLength": 10,
       "stack": false,
@@ -788,6 +815,13 @@
       "pointradius": 5,
       "points": false,
       "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": false,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
       "seriesOverrides": [],
       "spaceLength": 10,
       "stack": false,
@@ -1062,6 +1096,13 @@
       "pointradius": 5,
       "points": false,
       "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": false,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
       "seriesOverrides": [],
       "spaceLength": 10,
       "stack": false,
@@ -1280,6 +1321,13 @@
       "pointradius": 5,
       "points": false,
       "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": false,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
       "seriesOverrides": [],
       "spaceLength": 10,
       "stack": false,
@@ -1625,7 +1673,7 @@
     ]
   },
   "timezone": "",
-  "title": "Fabric",
+  "title": "Overview",
   "uid": "fabric1",
-  "version": 2
+  "version": 1
 }

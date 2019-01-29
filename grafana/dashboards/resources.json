@@ -16,8 +16,14 @@
     "gnetId": null,
     "graphTooltip": 0,
     "id": 2,
-    "iteration": 1548684817380,
-    "links": [],
+    "iteration": 1548723638101,
+    "links": [
+        {
+            "icon": "external link",
+            "tags": [],
+            "type": "dashboards"
+        }
+    ],
     "panels": [
         {
             "aliasColors": {},
@@ -464,7 +470,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 10,
             "scopedVars": {
                 "container": {
@@ -566,7 +572,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 12,
             "scopedVars": {
                 "container": {
@@ -690,7 +696,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 10,
             "scopedVars": {
                 "container": {
@@ -792,7 +798,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 12,
             "scopedVars": {
                 "container": {
@@ -1116,7 +1122,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 14,
             "scopedVars": {
                 "container": {
@@ -1218,7 +1224,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 16,
             "scopedVars": {
                 "container": {
@@ -1320,7 +1326,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 14,
             "scopedVars": {
                 "container": {
@@ -1422,7 +1428,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 16,
             "scopedVars": {
                 "container": {
@@ -1724,7 +1730,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 18,
             "scopedVars": {
                 "container": {
@@ -1826,7 +1832,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 20,
             "scopedVars": {
                 "container": {
@@ -1928,7 +1934,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 18,
             "scopedVars": {
                 "container": {
@@ -2030,7 +2036,7 @@
             "renderer": "flot",
             "repeat": null,
             "repeatDirection": "v",
-            "repeatIteration": 1548684817380,
+            "repeatIteration": 1548723638101,
             "repeatPanelId": 20,
             "scopedVars": {
                 "container": {
@@ -2211,7 +2217,7 @@
         ]
     },
     "timezone": "",
-    "title": "Performance",
-    "uid": "fabric2",
-    "version": 3
+    "title": "Resource Usages",
+    "uid": "resources",
+    "version": 1
 }
