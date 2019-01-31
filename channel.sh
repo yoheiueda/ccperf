@@ -6,7 +6,7 @@ orderer=$(jq --arg channel "$channel" -r '.channels[$channel].orderers[0]' conne
 endpoint=$(jq --arg orderer $orderer -r '.orderers[$orderer].url | sub("grpc.?://";"")' connection-profile.json)
 tlsca=$(jq --arg orderer $orderer -r '.orderers[$orderer].tlsCACerts.path' connection-profile.json)
 
-./peer.sh channel create --orderer $endpoint --channelID mychannel --file "./$channel.tx" --tls true --cafile $tlsca
+./peer.sh channel create --orderer $endpoint --channelID $channel --file "./$channel.tx" --tls true --cafile $tlsca
 
 peers=$(jq --arg channel "$channel" -r '.channels[$channel].peers | keys_unsorted | .[]' connection-profile.json)
 
