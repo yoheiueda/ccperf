@@ -134,10 +134,20 @@ services:
   prometheus:
     container_name: prometheus
     image: prom/prometheus
+    command:
+      - '--config.file=/config/prometheus.yml'
+      #- '--storage.tsdb.path=/data'
     volumes:
-      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus:/config
     ports:
       - {{ prometheus.port }}:9090
+    networks:
+      {{ network }}:
+
+  alertmanager:
+    image: prom/alertmanager
+    ports:
+      - 9093:9093
     networks:
       {{ network }}:
 
