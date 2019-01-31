@@ -1,0 +1,76 @@
+diff --git a/msp/mgmt/mgmt.go b/msp/mgmt/mgmt.go
+index 58495a911..2412e3a69 100644
+--- a/msp/mgmt/mgmt.go
++++ b/msp/mgmt/mgmt.go
+@@ -51,9 +51,10 @@ func LoadLocalMsp(dir string, bccspConfig *factory.FactoryOpts, mspID string) er
+ // OWNERSHIP OF PER-CHAIN MSP MANAGERS WILL BE HANDLED BY IT;
+ // HOWEVER IN THE INTERIM, THESE HELPER FUNCTIONS ARE REQUIRED
+ 
+-var m sync.Mutex
++var m sync.RWMutex
+ var localMsp msp.MSP
+-var mspMap map[string]msp.MSPManager = make(map[string]msp.MSPManager)
++
++var mspMap = sync.Map{}
+ var mspLogger = flogging.MustGetLogger("msp")
+ 
+ // TODO - this is a temporary solution to allow the peer to track whether the
+@@ -83,16 +84,19 @@ func (mgr *mspMgmtMgr) Setup(msps []msp.MSP) error {
+ // GetManagerForChain returns the msp manager for the supplied
+ // chain; if no such manager exists, one is created
+ func GetManagerForChain(chainID string) msp.MSPManager {
+-	m.Lock()
+-	defer m.Unlock()
++	// RLock is required here to inhibit updates of mspMap when GetDeserializers() is traversing it.
++	m.RLock()
++	defer m.RUnlock()
+ 
+-	mspMgr, ok := mspMap[chainID]
++	mspMgr, ok := mspMap.Load(chainID)
+ 	if !ok {
+-		mspLogger.Debugf("Created new msp manager for channel `%s`", chainID)
+ 		mspMgmtMgr := &mspMgmtMgr{msp.NewMSPManager(), false}
+-		mspMap[chainID] = mspMgmtMgr
+-		mspMgr = mspMgmtMgr
+-	} else {
++		mspMgr, ok = mspMap.LoadOrStore(chainID, mspMgmtMgr)
++		if !ok {
++			mspLogger.Debugf("Created new msp manager for channel `%s`", chainID)
++		}
++	}
++	if ok {
+ 		// check for internal mspManagerImpl and mspMgmtMgr types. if a different
+ 		// type is found, it's because a developer has added a new type that
+ 		// implements the MSPManager interface and should add a case to the logic
+@@ -102,7 +106,7 @@ func GetManagerForChain(chainID string) msp.MSPManager {
+ 		}
+ 		mspLogger.Debugf("Returning existing manager for channel '%s'", chainID)
+ 	}
+-	return mspMgr
++	return mspMgr.(msp.MSPManager)
+ }
+ 
+ // GetManagers returns all the managers registered
+@@ -112,9 +116,10 @@ func GetDeserializers() map[string]msp.IdentityDeserializer {
+ 
+ 	clone := make(map[string]msp.IdentityDeserializer)
+ 
+-	for key, mspManager := range mspMap {
+-		clone[key] = mspManager
+-	}
++	mspMap.Range(func(key, mspManager interface{}) bool {
++		clone[key.(string)] = mspManager.(msp.IdentityDeserializer)
++		return true
++	})
+ 
+ 	return clone
+ }
+@@ -126,7 +131,7 @@ func XXXSetMSPManager(chainID string, manager msp.MSPManager) {
+ 	m.Lock()
+ 	defer m.Unlock()
+ 
+-	mspMap[chainID] = &mspMgmtMgr{manager, true}
++	mspMap.Store(chainID, &mspMgmtMgr{manager, true})
+ }
+ 
+ // GetLocalMSP returns the local msp (and creates it if it doesn't exist)
