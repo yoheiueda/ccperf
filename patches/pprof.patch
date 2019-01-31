@@ -1,0 +1,106 @@
+diff --git a/orderer/common/localconfig/config.go b/orderer/common/localconfig/config.go
+index eee2c2766..e9bb68620 100644
+--- a/orderer/common/localconfig/config.go
++++ b/orderer/common/localconfig/config.go
+@@ -100,8 +100,11 @@ type Authentication struct {
+ 
+ // Profile contains configuration for Go pprof profiling.
+ type Profile struct {
+-	Enabled bool
+-	Address string
++	Enabled              bool
++	Address              string
++	CPUProfileRate       int
++	BlockProfileRate     int
++	MutexProfileFraction int
+ }
+ 
+ // FileLedger contains configuration for the file-based ledger.
+@@ -210,8 +213,11 @@ var Defaults = TopLevel{
+ 		SystemChannel:  "test-system-channel-name",
+ 		GenesisFile:    "genesisblock",
+ 		Profile: Profile{
+-			Enabled: false,
+-			Address: "0.0.0.0:6060",
++			Enabled:              false,
++			Address:              "0.0.0.0:6060",
++			CPUProfileRate:       0,
++			BlockProfileRate:     0,
++			MutexProfileFraction: 0,
+ 		},
+ 		LocalMSPDir: "msp",
+ 		LocalMSPID:  "SampleOrg",
+diff --git a/orderer/common/server/main.go b/orderer/common/server/main.go
+index b9df1122c..1dd56a0b7 100644
+--- a/orderer/common/server/main.go
++++ b/orderer/common/server/main.go
+@@ -16,6 +16,7 @@ import (
+ 	_ "net/http/pprof" // This is essentially the main package for the orderer
+ 	"os"
+ 	"os/signal"
++	"runtime"
+ 	"syscall"
+ 	"time"
+ 
+@@ -169,6 +170,10 @@ func initializeLogging() {
+ // Start the profiling service if enabled.
+ func initializeProfilingService(conf *localconfig.TopLevel) {
+ 	if conf.General.Profile.Enabled {
++		runtime.SetCPUProfileRate(conf.General.Profile.CPUProfileRate)
++		runtime.SetBlockProfileRate(conf.General.Profile.BlockProfileRate)
++		runtime.SetMutexProfileFraction(conf.General.Profile.MutexProfileFraction)
++
+ 		go func() {
+ 			logger.Info("Starting Go pprof profiling service on:", conf.General.Profile.Address)
+ 			// The ListenAndServe() call does not return unless an error occurs.
+diff --git a/peer/node/start.go b/peer/node/start.go
+index 87192f467..a3e34cb01 100644
+--- a/peer/node/start.go
++++ b/peer/node/start.go
+@@ -12,6 +12,7 @@ import (
+ 	"net/http"
+ 	"os"
+ 	"os/signal"
++	"runtime"
+ 	"syscall"
+ 	"time"
+ 
+@@ -386,6 +387,10 @@ func serve(args []string) error {
+ 
+ 	// Start profiling http endpoint if enabled
+ 	if profileEnabled {
++		runtime.SetCPUProfileRate(viper.GetInt("peer.profile.cpuProfileRate"))
++		runtime.SetBlockProfileRate(viper.GetInt("peer.profile.blockProfileRate"))
++		runtime.SetMutexProfileFraction(viper.GetInt("peer.profile.mutexProfileFraction"))
++
+ 		go func() {
+ 			logger.Infof("Starting profiling server with listenAddress = %s", profileListenAddress)
+ 			if profileErr := http.ListenAndServe(profileListenAddress, nil); profileErr != nil {
+diff --git a/sampleconfig/core.yaml b/sampleconfig/core.yaml
+index 32666c757..a06900e8b 100644
+--- a/sampleconfig/core.yaml
++++ b/sampleconfig/core.yaml
+@@ -307,6 +307,9 @@ peer:
+     profile:
+         enabled:     false
+         listenAddress: 0.0.0.0:6060
++        cpuProfileRate: 0
++        blockProfileRate: 0
++        mutexProfileFraction: 0
+ 
+     # The admin service is used for administrative operations such as
+     # control over logger levels, etc.
+diff --git a/sampleconfig/orderer.yaml b/sampleconfig/orderer.yaml
+index e9abd1fe7..86b105f5c 100644
+--- a/sampleconfig/orderer.yaml
++++ b/sampleconfig/orderer.yaml
+@@ -114,6 +114,9 @@ General:
+     Profile:
+         Enabled: false
+         Address: 0.0.0.0:6060
++        CPUProfileRate: 0
++        BlockProfileRate: 0
++        MutexProfileFraction: 0
+ 
+     # BCCSP configures the blockchain crypto service providers.
+     BCCSP:
