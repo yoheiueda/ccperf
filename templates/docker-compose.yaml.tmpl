@@ -10,7 +10,7 @@ services:
     image: hyperledger/fabric-orderer:${FABRIC_TAG}
     environment:
       #- ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
-      - FABRIC_LOGGING_SPEC=INFO
+      - FABRIC_LOGGING_SPEC=${FABRIC_LOGGING_SPEC}
       - ORDERER_OPERATIONS_LISTENADDRESS=0.0.0.0:8080
       - ORDERER_OPERATIONS_TLS_ENABLED=false
       - ORDERER_METRICS_PROVIDER=prometheus
@@ -57,7 +57,7 @@ services:
     container_name: {{ org.name }}-{{ peer.name }}
     image: hyperledger/fabric-peer:${FABRIC_TAG}
     environment:
-      - FABRIC_LOGGING_SPEC=INFO
+      - FABRIC_LOGGING_SPEC=${FABRIC_LOGGING_SPEC}
       - CORE_OPERATIONS_LISTENADDRESS=0.0.0.0:8080
       - CORE_OPERATIONS_TLS_ENABLED=false
       - CORE_METRICS_PROVIDER=prometheus
