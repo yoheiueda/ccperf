@@ -9,4 +9,4 @@ tag="$arch-$orig"
 docker pull hyperledger/fabric-baseos:"$tag"
 docker tag hyperledger/fabric-baseos:"$tag"  hyperledger/fabric-baseos:"$tag-$suffix"
 
-docker build -t hyplerledger/fabric-baseimage:"$tag-$suffix" .
+docker build -t hyperledger/fabric-baseimage:"$tag-$suffix" .
