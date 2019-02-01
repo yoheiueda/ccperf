@@ -1,0 +1,975 @@
+From a7917ef50f1d134135c075c155b6cc405ddd99f5 Mon Sep 17 00:00:00 2001
+From: Yohei Ueda <yohei@jp.ibm.com>
+Date: Fri, 1 Feb 2019 21:30:16 +0900
+Subject: [PATCH] Add WriteBack update mode in shim
+
+Change-Id: Idbec41929d1f97133453fcc447a7bec1ad37ec78
+Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
+---
+ core/chaincode/handler.go         |  57 ++++++
+ core/chaincode/shim/chaincode.go  |  40 ++++
+ core/chaincode/shim/handler.go    |  10 +
+ core/chaincode/shim/interfaces.go |  12 ++
+ core/chaincode/shim/mockstub.go   |   4 +
+ core/chaincode/shim/shim_test.go  |  51 +++++
+ protos/peer/chaincode_shim.pb.go  | 305 ++++++++++++++++++------------
+ protos/peer/chaincode_shim.proto  |   6 +
+ 8 files changed, 359 insertions(+), 126 deletions(-)
+
+diff --git a/core/chaincode/handler.go b/core/chaincode/handler.go
+index 70e75de43..bc949f2d9 100644
+--- a/core/chaincode/handler.go
++++ b/core/chaincode/handler.go
+@@ -19,6 +19,7 @@ import (
+ 	"github.com/hyperledger/fabric/common/flogging"
+ 	commonledger "github.com/hyperledger/fabric/common/ledger"
+ 	"github.com/hyperledger/fabric/core/aclmgmt/resources"
++	"github.com/hyperledger/fabric/core/chaincode/shim"
+ 	"github.com/hyperledger/fabric/core/common/ccprovider"
+ 	"github.com/hyperledger/fabric/core/common/privdata"
+ 	"github.com/hyperledger/fabric/core/common/sysccprovider"
+@@ -198,10 +199,66 @@ func (h *Handler) handleMessageCreatedState(msg *pb.ChaincodeMessage) error {
+ 	return nil
+ }
+ 
++func (h *Handler) handleWriteBack(ccMsg *pb.ChaincodeMessage) {
++	chaincodeLogger.Debugf("[%s] handling %s from chaincode", shorttxid(ccMsg.Txid), ccMsg.Type.String())
++	res := func() *pb.ChaincodeMessage {
++		if !h.registerTxid(ccMsg) {
++			return nil
++		}
++		defer h.ActiveTransactions.Remove(ccMsg.ChannelId, ccMsg.Txid)
++
++		txContext, err := h.isValidTxSim(ccMsg.ChannelId, ccMsg.Txid, "no ledger context")
++		if err != nil {
++			chaincodeLogger.Errorf("[%s] Failed to get txSim for %s from chaincode", shorttxid(ccMsg.Txid), ccMsg.Type.String())
++			return nil
++		}
++
++		writeBack := &pb.CompletedWriteBack{}
++		err = proto.Unmarshal(ccMsg.Payload, writeBack)
++		if err != nil {
++			chaincodeLogger.Errorf("[%s] Failed to unmarshall %s from chaincode", shorttxid(ccMsg.Txid), ccMsg.Type.String())
++			return nil
++		}
++
++		for _, msg := range writeBack.Updates {
++			chaincodeLogger.Debugf("[%s] handling %s in write back cache from chaincode", shorttxid(msg.Txid), msg.Type.String())
++			switch msg.Type {
++			case pb.ChaincodeMessage_PUT_STATE:
++				_, err = h.HandlePutState(msg, txContext)
++			case pb.ChaincodeMessage_DEL_STATE:
++				_, err = h.HandleDelState(msg, txContext)
++			default:
++				chaincodeLogger.Errorf("[%s] Unsupported message type %s in %s from chaincode", shorttxid(ccMsg.Txid), msg.Type.String(), ccMsg.Type.String())
++				return nil
++			}
++
++			if err != nil {
++				err = errors.Wrapf(err, "%s failed to process write back: transaction ID: %s", msg.Type, msg.Txid)
++				chaincodeLogger.Errorf("[%s] Failed to handle %s in %s. error: %+v", shorttxid(msg.Txid), msg.Type, ccMsg.Type, err)
++				errorRes := shim.Error(err.Error())
++
++				resBytes, err := proto.Marshal(&errorRes)
++				if err != nil {
++					chaincodeLogger.Errorf("[%s] Failed to create an error response for %s in %s from chaincode", shorttxid(ccMsg.Txid), ccMsg.Type.String())
++					return nil
++				}
++				return &pb.ChaincodeMessage{Type: pb.ChaincodeMessage_ERROR, Payload: resBytes, Txid: ccMsg.Txid, ChaincodeEvent: ccMsg.ChaincodeEvent, ChannelId: ccMsg.ChannelId}
++			}
++		}
++		return &pb.ChaincodeMessage{Type: pb.ChaincodeMessage_COMPLETED, Payload: writeBack.Response, Txid: ccMsg.Txid, ChaincodeEvent: ccMsg.ChaincodeEvent, ChannelId: ccMsg.ChannelId}
++	}()
++
++	if res != nil {
++		h.Notify(res)
++	}
++}
++
+ func (h *Handler) handleMessageReadyState(msg *pb.ChaincodeMessage) error {
+ 	switch msg.Type {
+ 	case pb.ChaincodeMessage_COMPLETED, pb.ChaincodeMessage_ERROR:
+ 		h.Notify(msg)
++	case pb.ChaincodeMessage_COMPLETED_WRITEBACK:
++		go h.handleWriteBack(msg)
+ 
+ 	case pb.ChaincodeMessage_PUT_STATE:
+ 		go h.HandleTransaction(msg, h.HandlePutState)
+diff --git a/core/chaincode/shim/chaincode.go b/core/chaincode/shim/chaincode.go
+index 3c6532ad7..a21b90102 100644
+--- a/core/chaincode/shim/chaincode.go
++++ b/core/chaincode/shim/chaincode.go
+@@ -59,6 +59,8 @@ type ChaincodeStub struct {
+ 	signedProposal             *pb.SignedProposal
+ 	proposal                   *pb.Proposal
+ 	validationParameterMetakey string
++	updateMode                 UpdateMode
++	writeBackCache             []*pb.ChaincodeMessage
+ 
+ 	// Additional fields extracted from the signedProposal
+ 	creator   []byte
+@@ -397,6 +399,12 @@ func (stub *ChaincodeStub) init(handler *Handler, channelId string, txid string,
+ 	stub.signedProposal = signedProposal
+ 	stub.decorations = input.Decorations
+ 	stub.validationParameterMetakey = pb.MetaDataKeys_VALIDATION_PARAMETER.String()
++	if channelId == "" {
++		stub.updateMode = WriteThrough
++	} else {
++		chaincodeLogger.Debugf("[%s] WriteBack enabled for %s", shorttxid(stub.TxID), channelId)
++		stub.updateMode = WriteBack
++	}
+ 
+ 	// TODO: sanity check: verify that every call to init with a nil
+ 	// signedProposal is a legitimate one, meaning it is an internal call
+@@ -475,6 +483,17 @@ func (stub *ChaincodeStub) GetStateValidationParameter(key string) ([]byte, erro
+ 	return nil, nil
+ }
+ 
++func (stub *ChaincodeStub) addToWriteBackCache(msgType pb.ChaincodeMessage_Type, msg proto.Message) error {
++	// Construct payload
++	payloadBytes, _ := proto.Marshal(msg)
++
++	ccMsg := &pb.ChaincodeMessage{Type: msgType, Payload: payloadBytes, Txid: stub.TxID, ChannelId: stub.ChannelId}
++	chaincodeLogger.Debugf("[%s] Caching %s for write back", shorttxid(stub.TxID), msgType)
++
++	stub.writeBackCache = append(stub.writeBackCache, ccMsg)
++	return nil
++}
++
+ // PutState documentation can be found in interfaces.go
+ func (stub *ChaincodeStub) PutState(key string, value []byte) error {
+ 	if key == "" {
+@@ -482,6 +501,9 @@ func (stub *ChaincodeStub) PutState(key string, value []byte) error {
+ 	}
+ 	// Access public data by setting the collection to empty string
+ 	collection := ""
++	if stub.updateMode == WriteBack {
++		return stub.addToWriteBackCache(pb.ChaincodeMessage_PUT_STATE, &pb.PutState{Collection: collection, Key: key, Value: value})
++	}
+ 	return stub.handler.handlePutState(collection, key, value, stub.ChannelId, stub.TxID)
+ }
+ 
+@@ -508,6 +530,9 @@ func (stub *ChaincodeStub) GetQueryResult(query string) (StateQueryIteratorInter
+ func (stub *ChaincodeStub) DelState(key string) error {
+ 	// Access public data by setting the collection to empty string
+ 	collection := ""
++	if stub.updateMode == WriteBack {
++		return stub.addToWriteBackCache(pb.ChaincodeMessage_DEL_STATE, &pb.DelState{Collection: collection, Key: key})
++	}
+ 	return stub.handler.handleDelState(collection, key, stub.ChannelId, stub.TxID)
+ }
+ 
+@@ -529,6 +554,9 @@ func (stub *ChaincodeStub) PutPrivateData(collection string, key string, value [
+ 	if key == "" {
+ 		return fmt.Errorf("key must not be an empty string")
+ 	}
++	if stub.updateMode == WriteBack {
++		return stub.addToWriteBackCache(pb.ChaincodeMessage_PUT_STATE, &pb.PutState{Collection: collection, Key: key, Value: value})
++	}
+ 	return stub.handler.handlePutState(collection, key, value, stub.ChannelId, stub.TxID)
+ }
+ 
+@@ -537,6 +565,9 @@ func (stub *ChaincodeStub) DelPrivateData(collection string, key string) error {
+ 	if collection == "" {
+ 		return fmt.Errorf("collection must not be an empty string")
+ 	}
++	if stub.updateMode == WriteBack {
++		return stub.addToWriteBackCache(pb.ChaincodeMessage_DEL_STATE, &pb.DelState{Collection: collection, Key: key})
++	}
+ 	return stub.handler.handleDelState(collection, key, stub.ChannelId, stub.TxID)
+ }
+ 
+@@ -1013,6 +1044,15 @@ func (stub *ChaincodeStub) GetTxTimestamp() (*timestamp.Timestamp, error) {
+ 	return chdr.GetTimestamp(), nil
+ }
+ 
++// SetUpdateMode documentation can be found in interfaces.go
++func (stub *ChaincodeStub) SetUpdateMode(mode UpdateMode) error {
++	if mode != WriteThrough && mode != WriteBack {
++		return errors.New("Unknown update mode")
++	}
++	stub.updateMode = mode
++	return nil
++}
++
+ // ------------- ChaincodeEvent API ----------------------
+ 
+ // SetEvent documentation can be found in interfaces.go
+diff --git a/core/chaincode/shim/handler.go b/core/chaincode/shim/handler.go
+index 15dcddf76..4c0c6f22e 100644
+--- a/core/chaincode/shim/handler.go
++++ b/core/chaincode/shim/handler.go
+@@ -278,6 +278,16 @@ func (handler *Handler) handleTransaction(msg *pb.ChaincodeMessage, errc chan er
+ 			return
+ 		}
+ 
++		if stub.updateMode == WriteBack && len(stub.writeBackCache) > 0 {
++			writeBack := pb.CompletedWriteBack{Response: resBytes, Updates: stub.writeBackCache}
++			writeBackBytes, err := proto.Marshal(&writeBack)
++			if err != nil {
++				return
++			}
++			nextStateMsg = &pb.ChaincodeMessage{Type: pb.ChaincodeMessage_COMPLETED_WRITEBACK, Payload: writeBackBytes, Txid: msg.Txid, ChaincodeEvent: stub.chaincodeEvent, ChannelId: stub.ChannelId}
++			return
++		}
++
+ 		// Send COMPLETED message to chaincode support and change state
+ 		chaincodeLogger.Debugf("[%s] Transaction completed. Sending %s", shorttxid(msg.Txid), pb.ChaincodeMessage_COMPLETED)
+ 		nextStateMsg = &pb.ChaincodeMessage{Type: pb.ChaincodeMessage_COMPLETED, Payload: resBytes, Txid: msg.Txid, ChaincodeEvent: stub.chaincodeEvent, ChannelId: stub.ChannelId}
+diff --git a/core/chaincode/shim/interfaces.go b/core/chaincode/shim/interfaces.go
+index 2a58b883d..4922ab502 100644
+--- a/core/chaincode/shim/interfaces.go
++++ b/core/chaincode/shim/interfaces.go
+@@ -336,6 +336,9 @@ type ChaincodeStubInterface interface {
+ 	// client's timestamp and will have the same value across all endorsers.
+ 	GetTxTimestamp() (*timestamp.Timestamp, error)
+ 
++	// SetUpdateMode changes update mode of PutState and DelState
++	SetUpdateMode(mode UpdateMode) error
++
+ 	// SetEvent allows the chaincode to set an event on the response to the
+ 	// proposal to be included as part of a transaction. The event will be
+ 	// available within the transaction in the committed block regardless of the
+@@ -343,6 +346,15 @@ type ChaincodeStubInterface interface {
+ 	SetEvent(name string, payload []byte) error
+ }
+ 
++// UpdateMode specifies how PutState and DelState are deliverted to peer
++type UpdateMode int
++
++// Update modes
++const (
++	WriteThrough UpdateMode = iota
++	WriteBack
++)
++
+ // CommonIteratorInterface allows a chaincode to check whether any more result
+ // to be fetched from an iterator and close it when done.
+ type CommonIteratorInterface interface {
+diff --git a/core/chaincode/shim/mockstub.go b/core/chaincode/shim/mockstub.go
+index 303baa6c4..e4032a8a4 100644
+--- a/core/chaincode/shim/mockstub.go
++++ b/core/chaincode/shim/mockstub.go
+@@ -425,6 +425,10 @@ func (stub *MockStub) GetPrivateDataValidationParameter(collection, key string)
+ 	return m[key], nil
+ }
+ 
++func (stub *MockStub) SetUpdateMode(mode UpdateMode) error {
++	return nil
++}
++
+ // Constructor to initialise the internal State map
+ func NewMockStub(name string, cc Chaincode) *MockStub {
+ 	mockLogger.Debug("MockStub(", name, cc, ")")
+diff --git a/core/chaincode/shim/shim_test.go b/core/chaincode/shim/shim_test.go
+index 532ae72fd..7a7c6efd8 100644
+--- a/core/chaincode/shim/shim_test.go
++++ b/core/chaincode/shim/shim_test.go
+@@ -87,6 +87,8 @@ func (t *shimTestCC) Invoke(stub ChaincodeStubInterface) pb.Response {
+ 		return t.putEP(stub)
+ 	} else if function == "getep" {
+ 		return t.getEP(stub)
++	} else if function == "writeback" {
++		return t.writeback(stub, args)
+ 	}
+ 
+ 	return Error("Invalid invoke function name. Expecting \"invoke\" \"delete\" \"query\"")
+@@ -360,6 +362,42 @@ func (t *shimTestCC) getEP(stub ChaincodeStubInterface) pb.Response {
+ 	return Success(ep)
+ }
+ 
++// Test write back mode
++func (t *shimTestCC) writeback(stub ChaincodeStubInterface, args []string) pb.Response {
++	if len(args) != 0 {
++		return Error("Incorrect number of arguments. Expecting 0")
++	}
++
++	err := stub.SetUpdateMode(WriteThrough)
++	if err != nil {
++		return Error(err.Error())
++	}
++
++	err = stub.SetUpdateMode(2)
++	if err == nil {
++		return Error("Incorrect return value. Expecting non-nil")
++	}
++
++	err = stub.SetUpdateMode(WriteBack)
++	if err != nil {
++		return Error(err.Error())
++	}
++
++	// Put a value with a key
++	err = stub.PutState("key1", []byte("ABC"))
++	if err != nil {
++		return Error("Failed to put state")
++	}
++
++	// Delete a key
++	err = stub.DelState("key2")
++	if err != nil {
++		return Error("Failed to delete state")
++	}
++
++	return Success(nil)
++}
++
+ // Test Go shim functionality that can be tested outside of a real chaincode
+ // context.
+ 
+@@ -925,6 +963,19 @@ func TestInvoke(t *testing.T) {
+ 
+ 	//wait for done
+ 	processDone(t, done, false)
++
++	//write back
++
++	respSet = &mockpeer.MockResponseSet{errorFunc, errorFunc, []*mockpeer.MockResponse{
++		{&pb.ChaincodeMessage{Type: pb.ChaincodeMessage_COMPLETED_WRITEBACK, Txid: "9", ChannelId: channelId}, nil}}}
++	peerSide.SetResponses(respSet)
++
++	ci = &pb.ChaincodeInput{Args: [][]byte{[]byte("writeback")}, Decorations: nil}
++	payload = utils.MarshalOrPanic(ci)
++	peerSide.Send(&pb.ChaincodeMessage{Type: pb.ChaincodeMessage_TRANSACTION, Payload: payload, Txid: "9", ChannelId: channelId})
++
++	//wait for done
++	processDone(t, done, false)
+ }
+ 
+ func TestSetKeyEP(t *testing.T) {
+diff --git a/protos/peer/chaincode_shim.pb.go b/protos/peer/chaincode_shim.pb.go
+index e708d1e74..7c47287a8 100644
+--- a/protos/peer/chaincode_shim.pb.go
++++ b/protos/peer/chaincode_shim.pb.go
+@@ -48,6 +48,7 @@ const (
+ 	ChaincodeMessage_GET_HISTORY_FOR_KEY ChaincodeMessage_Type = 19
+ 	ChaincodeMessage_GET_STATE_METADATA  ChaincodeMessage_Type = 20
+ 	ChaincodeMessage_PUT_STATE_METADATA  ChaincodeMessage_Type = 21
++	ChaincodeMessage_COMPLETED_WRITEBACK ChaincodeMessage_Type = 22
+ )
+ 
+ var ChaincodeMessage_Type_name = map[int32]string{
+@@ -72,6 +73,7 @@ var ChaincodeMessage_Type_name = map[int32]string{
+ 	19: "GET_HISTORY_FOR_KEY",
+ 	20: "GET_STATE_METADATA",
+ 	21: "PUT_STATE_METADATA",
++	22: "COMPLETED_WRITEBACK",
+ }
+ var ChaincodeMessage_Type_value = map[string]int32{
+ 	"UNDEFINED":           0,
+@@ -95,27 +97,28 @@ var ChaincodeMessage_Type_value = map[string]int32{
+ 	"GET_HISTORY_FOR_KEY": 19,
+ 	"GET_STATE_METADATA":  20,
+ 	"PUT_STATE_METADATA":  21,
++	"COMPLETED_WRITEBACK": 22,
+ }
+ 
+ func (x ChaincodeMessage_Type) String() string {
+ 	return proto.EnumName(ChaincodeMessage_Type_name, int32(x))
+ }
+ func (ChaincodeMessage_Type) EnumDescriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{0, 0}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{0, 0}
+ }
+ 
+ type ChaincodeMessage struct {
+-	Type      ChaincodeMessage_Type `protobuf:"varint,1,opt,name=type,proto3,enum=protos.ChaincodeMessage_Type" json:"type,omitempty"`
+-	Timestamp *timestamp.Timestamp  `protobuf:"bytes,2,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
++	Type      ChaincodeMessage_Type `protobuf:"varint,1,opt,name=type,enum=protos.ChaincodeMessage_Type" json:"type,omitempty"`
++	Timestamp *timestamp.Timestamp  `protobuf:"bytes,2,opt,name=timestamp" json:"timestamp,omitempty"`
+ 	Payload   []byte                `protobuf:"bytes,3,opt,name=payload,proto3" json:"payload,omitempty"`
+-	Txid      string                `protobuf:"bytes,4,opt,name=txid,proto3" json:"txid,omitempty"`
+-	Proposal  *SignedProposal       `protobuf:"bytes,5,opt,name=proposal,proto3" json:"proposal,omitempty"`
++	Txid      string                `protobuf:"bytes,4,opt,name=txid" json:"txid,omitempty"`
++	Proposal  *SignedProposal       `protobuf:"bytes,5,opt,name=proposal" json:"proposal,omitempty"`
+ 	// event emitted by chaincode. Used only with Init or Invoke.
+ 	// This event is then stored (currently)
+ 	// with Block.NonHashData.TransactionResult
+-	ChaincodeEvent *ChaincodeEvent `protobuf:"bytes,6,opt,name=chaincode_event,json=chaincodeEvent,proto3" json:"chaincode_event,omitempty"`
++	ChaincodeEvent *ChaincodeEvent `protobuf:"bytes,6,opt,name=chaincode_event,json=chaincodeEvent" json:"chaincode_event,omitempty"`
+ 	// channel id
+-	ChannelId            string   `protobuf:"bytes,7,opt,name=channel_id,json=channelId,proto3" json:"channel_id,omitempty"`
++	ChannelId            string   `protobuf:"bytes,7,opt,name=channel_id,json=channelId" json:"channel_id,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -125,7 +128,7 @@ func (m *ChaincodeMessage) Reset()         { *m = ChaincodeMessage{} }
+ func (m *ChaincodeMessage) String() string { return proto.CompactTextString(m) }
+ func (*ChaincodeMessage) ProtoMessage()    {}
+ func (*ChaincodeMessage) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{0}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{0}
+ }
+ func (m *ChaincodeMessage) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_ChaincodeMessage.Unmarshal(m, b)
+@@ -198,8 +201,8 @@ func (m *ChaincodeMessage) GetChannelId() string {
+ // is to be fetched from the ledger. If the collection is specified, the key
+ // would be fetched from the collection (i.e., private state)
+ type GetState struct {
+-	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+-	Collection           string   `protobuf:"bytes,2,opt,name=collection,proto3" json:"collection,omitempty"`
++	Key                  string   `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
++	Collection           string   `protobuf:"bytes,2,opt,name=collection" json:"collection,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -209,7 +212,7 @@ func (m *GetState) Reset()         { *m = GetState{} }
+ func (m *GetState) String() string { return proto.CompactTextString(m) }
+ func (*GetState) ProtoMessage()    {}
+ func (*GetState) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{1}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{1}
+ }
+ func (m *GetState) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_GetState.Unmarshal(m, b)
+@@ -244,8 +247,8 @@ func (m *GetState) GetCollection() string {
+ }
+ 
+ type GetStateMetadata struct {
+-	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+-	Collection           string   `protobuf:"bytes,2,opt,name=collection,proto3" json:"collection,omitempty"`
++	Key                  string   `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
++	Collection           string   `protobuf:"bytes,2,opt,name=collection" json:"collection,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -255,7 +258,7 @@ func (m *GetStateMetadata) Reset()         { *m = GetStateMetadata{} }
+ func (m *GetStateMetadata) String() string { return proto.CompactTextString(m) }
+ func (*GetStateMetadata) ProtoMessage()    {}
+ func (*GetStateMetadata) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{2}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{2}
+ }
+ func (m *GetStateMetadata) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_GetStateMetadata.Unmarshal(m, b)
+@@ -294,9 +297,9 @@ func (m *GetStateMetadata) GetCollection() string {
+ // specified, the key and value would be written to the transaction's private
+ // write set.
+ type PutState struct {
+-	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
++	Key                  string   `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
+ 	Value                []byte   `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+-	Collection           string   `protobuf:"bytes,3,opt,name=collection,proto3" json:"collection,omitempty"`
++	Collection           string   `protobuf:"bytes,3,opt,name=collection" json:"collection,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -306,7 +309,7 @@ func (m *PutState) Reset()         { *m = PutState{} }
+ func (m *PutState) String() string { return proto.CompactTextString(m) }
+ func (*PutState) ProtoMessage()    {}
+ func (*PutState) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{3}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{3}
+ }
+ func (m *PutState) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_PutState.Unmarshal(m, b)
+@@ -348,9 +351,9 @@ func (m *PutState) GetCollection() string {
+ }
+ 
+ type PutStateMetadata struct {
+-	Key                  string         `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+-	Collection           string         `protobuf:"bytes,3,opt,name=collection,proto3" json:"collection,omitempty"`
+-	Metadata             *StateMetadata `protobuf:"bytes,4,opt,name=metadata,proto3" json:"metadata,omitempty"`
++	Key                  string         `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
++	Collection           string         `protobuf:"bytes,3,opt,name=collection" json:"collection,omitempty"`
++	Metadata             *StateMetadata `protobuf:"bytes,4,opt,name=metadata" json:"metadata,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{}       `json:"-"`
+ 	XXX_unrecognized     []byte         `json:"-"`
+ 	XXX_sizecache        int32          `json:"-"`
+@@ -360,7 +363,7 @@ func (m *PutStateMetadata) Reset()         { *m = PutStateMetadata{} }
+ func (m *PutStateMetadata) String() string { return proto.CompactTextString(m) }
+ func (*PutStateMetadata) ProtoMessage()    {}
+ func (*PutStateMetadata) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{4}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{4}
+ }
+ func (m *PutStateMetadata) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_PutStateMetadata.Unmarshal(m, b)
+@@ -406,8 +409,8 @@ func (m *PutStateMetadata) GetMetadata() *StateMetadata {
+ // If the collection is specified, the key needs to be recorded in the
+ // transaction's private write set as a delete operation.
+ type DelState struct {
+-	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+-	Collection           string   `protobuf:"bytes,2,opt,name=collection,proto3" json:"collection,omitempty"`
++	Key                  string   `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
++	Collection           string   `protobuf:"bytes,2,opt,name=collection" json:"collection,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -417,7 +420,7 @@ func (m *DelState) Reset()         { *m = DelState{} }
+ func (m *DelState) String() string { return proto.CompactTextString(m) }
+ func (*DelState) ProtoMessage()    {}
+ func (*DelState) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{5}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{5}
+ }
+ func (m *DelState) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_DelState.Unmarshal(m, b)
+@@ -456,9 +459,9 @@ func (m *DelState) GetCollection() string {
+ // the range query needs to be executed on the private data. The metadata hold
+ // the byte representation of QueryMetadata.
+ type GetStateByRange struct {
+-	StartKey             string   `protobuf:"bytes,1,opt,name=startKey,proto3" json:"startKey,omitempty"`
+-	EndKey               string   `protobuf:"bytes,2,opt,name=endKey,proto3" json:"endKey,omitempty"`
+-	Collection           string   `protobuf:"bytes,3,opt,name=collection,proto3" json:"collection,omitempty"`
++	StartKey             string   `protobuf:"bytes,1,opt,name=startKey" json:"startKey,omitempty"`
++	EndKey               string   `protobuf:"bytes,2,opt,name=endKey" json:"endKey,omitempty"`
++	Collection           string   `protobuf:"bytes,3,opt,name=collection" json:"collection,omitempty"`
+ 	Metadata             []byte   `protobuf:"bytes,4,opt,name=metadata,proto3" json:"metadata,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+@@ -469,7 +472,7 @@ func (m *GetStateByRange) Reset()         { *m = GetStateByRange{} }
+ func (m *GetStateByRange) String() string { return proto.CompactTextString(m) }
+ func (*GetStateByRange) ProtoMessage()    {}
+ func (*GetStateByRange) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{6}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{6}
+ }
+ func (m *GetStateByRange) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_GetStateByRange.Unmarshal(m, b)
+@@ -522,8 +525,8 @@ func (m *GetStateByRange) GetMetadata() []byte {
+ // If the collection is specified, the query needs to be executed on the
+ // private data.  The metadata hold the byte representation of QueryMetadata.
+ type GetQueryResult struct {
+-	Query                string   `protobuf:"bytes,1,opt,name=query,proto3" json:"query,omitempty"`
+-	Collection           string   `protobuf:"bytes,2,opt,name=collection,proto3" json:"collection,omitempty"`
++	Query                string   `protobuf:"bytes,1,opt,name=query" json:"query,omitempty"`
++	Collection           string   `protobuf:"bytes,2,opt,name=collection" json:"collection,omitempty"`
+ 	Metadata             []byte   `protobuf:"bytes,3,opt,name=metadata,proto3" json:"metadata,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+@@ -534,7 +537,7 @@ func (m *GetQueryResult) Reset()         { *m = GetQueryResult{} }
+ func (m *GetQueryResult) String() string { return proto.CompactTextString(m) }
+ func (*GetQueryResult) ProtoMessage()    {}
+ func (*GetQueryResult) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{7}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{7}
+ }
+ func (m *GetQueryResult) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_GetQueryResult.Unmarshal(m, b)
+@@ -579,8 +582,8 @@ func (m *GetQueryResult) GetMetadata() []byte {
+ // It contains a pageSize which denotes the number of records to be fetched
+ // and a bookmark.
+ type QueryMetadata struct {
+-	PageSize             int32    `protobuf:"varint,1,opt,name=pageSize,proto3" json:"pageSize,omitempty"`
+-	Bookmark             string   `protobuf:"bytes,2,opt,name=bookmark,proto3" json:"bookmark,omitempty"`
++	PageSize             int32    `protobuf:"varint,1,opt,name=pageSize" json:"pageSize,omitempty"`
++	Bookmark             string   `protobuf:"bytes,2,opt,name=bookmark" json:"bookmark,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -590,7 +593,7 @@ func (m *QueryMetadata) Reset()         { *m = QueryMetadata{} }
+ func (m *QueryMetadata) String() string { return proto.CompactTextString(m) }
+ func (*QueryMetadata) ProtoMessage()    {}
+ func (*QueryMetadata) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{8}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{8}
+ }
+ func (m *QueryMetadata) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_QueryMetadata.Unmarshal(m, b)
+@@ -627,7 +630,7 @@ func (m *QueryMetadata) GetBookmark() string {
+ // GetHistoryForKey is the payload of a ChaincodeMessage. It contains a key
+ // for which the historical values need to be retrieved.
+ type GetHistoryForKey struct {
+-	Key                  string   `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
++	Key                  string   `protobuf:"bytes,1,opt,name=key" json:"key,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -637,7 +640,7 @@ func (m *GetHistoryForKey) Reset()         { *m = GetHistoryForKey{} }
+ func (m *GetHistoryForKey) String() string { return proto.CompactTextString(m) }
+ func (*GetHistoryForKey) ProtoMessage()    {}
+ func (*GetHistoryForKey) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{9}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{9}
+ }
+ func (m *GetHistoryForKey) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_GetHistoryForKey.Unmarshal(m, b)
+@@ -665,7 +668,7 @@ func (m *GetHistoryForKey) GetKey() string {
+ }
+ 
+ type QueryStateNext struct {
+-	Id                   string   `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
++	Id                   string   `protobuf:"bytes,1,opt,name=id" json:"id,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -675,7 +678,7 @@ func (m *QueryStateNext) Reset()         { *m = QueryStateNext{} }
+ func (m *QueryStateNext) String() string { return proto.CompactTextString(m) }
+ func (*QueryStateNext) ProtoMessage()    {}
+ func (*QueryStateNext) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{10}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{10}
+ }
+ func (m *QueryStateNext) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_QueryStateNext.Unmarshal(m, b)
+@@ -703,7 +706,7 @@ func (m *QueryStateNext) GetId() string {
+ }
+ 
+ type QueryStateClose struct {
+-	Id                   string   `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
++	Id                   string   `protobuf:"bytes,1,opt,name=id" json:"id,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -713,7 +716,7 @@ func (m *QueryStateClose) Reset()         { *m = QueryStateClose{} }
+ func (m *QueryStateClose) String() string { return proto.CompactTextString(m) }
+ func (*QueryStateClose) ProtoMessage()    {}
+ func (*QueryStateClose) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{11}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{11}
+ }
+ func (m *QueryStateClose) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_QueryStateClose.Unmarshal(m, b)
+@@ -752,7 +755,7 @@ func (m *QueryResultBytes) Reset()         { *m = QueryResultBytes{} }
+ func (m *QueryResultBytes) String() string { return proto.CompactTextString(m) }
+ func (*QueryResultBytes) ProtoMessage()    {}
+ func (*QueryResultBytes) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{12}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{12}
+ }
+ func (m *QueryResultBytes) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_QueryResultBytes.Unmarshal(m, b)
+@@ -785,9 +788,9 @@ func (m *QueryResultBytes) GetResultBytes() []byte {
+ // the peer in has_more field, transaction id in id field, and a QueryResponseMetadata
+ // in metadata field.
+ type QueryResponse struct {
+-	Results              []*QueryResultBytes `protobuf:"bytes,1,rep,name=results,proto3" json:"results,omitempty"`
+-	HasMore              bool                `protobuf:"varint,2,opt,name=has_more,json=hasMore,proto3" json:"has_more,omitempty"`
+-	Id                   string              `protobuf:"bytes,3,opt,name=id,proto3" json:"id,omitempty"`
++	Results              []*QueryResultBytes `protobuf:"bytes,1,rep,name=results" json:"results,omitempty"`
++	HasMore              bool                `protobuf:"varint,2,opt,name=has_more,json=hasMore" json:"has_more,omitempty"`
++	Id                   string              `protobuf:"bytes,3,opt,name=id" json:"id,omitempty"`
+ 	Metadata             []byte              `protobuf:"bytes,4,opt,name=metadata,proto3" json:"metadata,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
+ 	XXX_unrecognized     []byte              `json:"-"`
+@@ -798,7 +801,7 @@ func (m *QueryResponse) Reset()         { *m = QueryResponse{} }
+ func (m *QueryResponse) String() string { return proto.CompactTextString(m) }
+ func (*QueryResponse) ProtoMessage()    {}
+ func (*QueryResponse) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{13}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{13}
+ }
+ func (m *QueryResponse) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_QueryResponse.Unmarshal(m, b)
+@@ -849,8 +852,8 @@ func (m *QueryResponse) GetMetadata() []byte {
+ // QueryResponseMetadata is the metadata of a QueryResponse. It contains a count
+ // which denotes the number of records fetched from the ledger and a bookmark.
+ type QueryResponseMetadata struct {
+-	FetchedRecordsCount  int32    `protobuf:"varint,1,opt,name=fetched_records_count,json=fetchedRecordsCount,proto3" json:"fetched_records_count,omitempty"`
+-	Bookmark             string   `protobuf:"bytes,2,opt,name=bookmark,proto3" json:"bookmark,omitempty"`
++	FetchedRecordsCount  int32    `protobuf:"varint,1,opt,name=fetched_records_count,json=fetchedRecordsCount" json:"fetched_records_count,omitempty"`
++	Bookmark             string   `protobuf:"bytes,2,opt,name=bookmark" json:"bookmark,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+ 	XXX_sizecache        int32    `json:"-"`
+@@ -860,7 +863,7 @@ func (m *QueryResponseMetadata) Reset()         { *m = QueryResponseMetadata{} }
+ func (m *QueryResponseMetadata) String() string { return proto.CompactTextString(m) }
+ func (*QueryResponseMetadata) ProtoMessage()    {}
+ func (*QueryResponseMetadata) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{14}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{14}
+ }
+ func (m *QueryResponseMetadata) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_QueryResponseMetadata.Unmarshal(m, b)
+@@ -895,7 +898,7 @@ func (m *QueryResponseMetadata) GetBookmark() string {
+ }
+ 
+ type StateMetadata struct {
+-	Metakey              string   `protobuf:"bytes,1,opt,name=metakey,proto3" json:"metakey,omitempty"`
++	Metakey              string   `protobuf:"bytes,1,opt,name=metakey" json:"metakey,omitempty"`
+ 	Value                []byte   `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+ 	XXX_unrecognized     []byte   `json:"-"`
+@@ -906,7 +909,7 @@ func (m *StateMetadata) Reset()         { *m = StateMetadata{} }
+ func (m *StateMetadata) String() string { return proto.CompactTextString(m) }
+ func (*StateMetadata) ProtoMessage()    {}
+ func (*StateMetadata) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{15}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{15}
+ }
+ func (m *StateMetadata) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_StateMetadata.Unmarshal(m, b)
+@@ -941,7 +944,7 @@ func (m *StateMetadata) GetValue() []byte {
+ }
+ 
+ type StateMetadataResult struct {
+-	Entries              []*StateMetadata `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
++	Entries              []*StateMetadata `protobuf:"bytes,1,rep,name=entries" json:"entries,omitempty"`
+ 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
+ 	XXX_unrecognized     []byte           `json:"-"`
+ 	XXX_sizecache        int32            `json:"-"`
+@@ -951,7 +954,7 @@ func (m *StateMetadataResult) Reset()         { *m = StateMetadataResult{} }
+ func (m *StateMetadataResult) String() string { return proto.CompactTextString(m) }
+ func (*StateMetadataResult) ProtoMessage()    {}
+ func (*StateMetadataResult) Descriptor() ([]byte, []int) {
+-	return fileDescriptor_chaincode_shim_3c6cdf1ba834f673, []int{16}
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{16}
+ }
+ func (m *StateMetadataResult) XXX_Unmarshal(b []byte) error {
+ 	return xxx_messageInfo_StateMetadataResult.Unmarshal(m, b)
+@@ -978,6 +981,52 @@ func (m *StateMetadataResult) GetEntries() []*StateMetadata {
+ 	return nil
+ }
+ 
++type CompletedWriteBack struct {
++	Response             []byte              `protobuf:"bytes,1,opt,name=response,proto3" json:"response,omitempty"`
++	Updates              []*ChaincodeMessage `protobuf:"bytes,2,rep,name=updates" json:"updates,omitempty"`
++	XXX_NoUnkeyedLiteral struct{}            `json:"-"`
++	XXX_unrecognized     []byte              `json:"-"`
++	XXX_sizecache        int32               `json:"-"`
++}
++
++func (m *CompletedWriteBack) Reset()         { *m = CompletedWriteBack{} }
++func (m *CompletedWriteBack) String() string { return proto.CompactTextString(m) }
++func (*CompletedWriteBack) ProtoMessage()    {}
++func (*CompletedWriteBack) Descriptor() ([]byte, []int) {
++	return fileDescriptor_chaincode_shim_d860978fd7e69f07, []int{17}
++}
++func (m *CompletedWriteBack) XXX_Unmarshal(b []byte) error {
++	return xxx_messageInfo_CompletedWriteBack.Unmarshal(m, b)
++}
++func (m *CompletedWriteBack) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
++	return xxx_messageInfo_CompletedWriteBack.Marshal(b, m, deterministic)
++}
++func (dst *CompletedWriteBack) XXX_Merge(src proto.Message) {
++	xxx_messageInfo_CompletedWriteBack.Merge(dst, src)
++}
++func (m *CompletedWriteBack) XXX_Size() int {
++	return xxx_messageInfo_CompletedWriteBack.Size(m)
++}
++func (m *CompletedWriteBack) XXX_DiscardUnknown() {
++	xxx_messageInfo_CompletedWriteBack.DiscardUnknown(m)
++}
++
++var xxx_messageInfo_CompletedWriteBack proto.InternalMessageInfo
++
++func (m *CompletedWriteBack) GetResponse() []byte {
++	if m != nil {
++		return m.Response
++	}
++	return nil
++}
++
++func (m *CompletedWriteBack) GetUpdates() []*ChaincodeMessage {
++	if m != nil {
++		return m.Updates
++	}
++	return nil
++}
++
+ func init() {
+ 	proto.RegisterType((*ChaincodeMessage)(nil), "protos.ChaincodeMessage")
+ 	proto.RegisterType((*GetState)(nil), "protos.GetState")
+@@ -996,6 +1045,7 @@ func init() {
+ 	proto.RegisterType((*QueryResponseMetadata)(nil), "protos.QueryResponseMetadata")
+ 	proto.RegisterType((*StateMetadata)(nil), "protos.StateMetadata")
+ 	proto.RegisterType((*StateMetadataResult)(nil), "protos.StateMetadataResult")
++	proto.RegisterType((*CompletedWriteBack)(nil), "protos.CompletedWriteBack")
+ 	proto.RegisterEnum("protos.ChaincodeMessage_Type", ChaincodeMessage_Type_name, ChaincodeMessage_Type_value)
+ }
+ 
+@@ -1007,9 +1057,8 @@ var _ grpc.ClientConn
+ // is compatible with the grpc package it is being compiled against.
+ const _ = grpc.SupportPackageIsVersion4
+ 
+-// ChaincodeSupportClient is the client API for ChaincodeSupport service.
+-//
+-// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://godoc.org/google.golang.org/grpc#ClientConn.NewStream.
++// Client API for ChaincodeSupport service
++
+ type ChaincodeSupportClient interface {
+ 	Register(ctx context.Context, opts ...grpc.CallOption) (ChaincodeSupport_RegisterClient, error)
+ }
+@@ -1023,7 +1072,7 @@ func NewChaincodeSupportClient(cc *grpc.ClientConn) ChaincodeSupportClient {
+ }
+ 
+ func (c *chaincodeSupportClient) Register(ctx context.Context, opts ...grpc.CallOption) (ChaincodeSupport_RegisterClient, error) {
+-	stream, err := c.cc.NewStream(ctx, &_ChaincodeSupport_serviceDesc.Streams[0], "/protos.ChaincodeSupport/Register", opts...)
++	stream, err := grpc.NewClientStream(ctx, &_ChaincodeSupport_serviceDesc.Streams[0], c.cc, "/protos.ChaincodeSupport/Register", opts...)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -1053,7 +1102,8 @@ func (x *chaincodeSupportRegisterClient) Recv() (*ChaincodeMessage, error) {
+ 	return m, nil
+ }
+ 
+-// ChaincodeSupportServer is the server API for ChaincodeSupport service.
++// Server API for ChaincodeSupport service
++
+ type ChaincodeSupportServer interface {
+ 	Register(ChaincodeSupport_RegisterServer) error
+ }
+@@ -1104,73 +1154,76 @@ var _ChaincodeSupport_serviceDesc = grpc.ServiceDesc{
+ }
+ 
+ func init() {
+-	proto.RegisterFile("peer/chaincode_shim.proto", fileDescriptor_chaincode_shim_3c6cdf1ba834f673)
+-}
+-
+-var fileDescriptor_chaincode_shim_3c6cdf1ba834f673 = []byte{
+-	// 1010 bytes of a gzipped FileDescriptorProto
+-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x56, 0xcf, 0x73, 0xda, 0x46,
+-	0x14, 0x0e, 0x06, 0x8c, 0x78, 0xd8, 0x78, 0xb3, 0x8e, 0x5d, 0xc2, 0x4c, 0x5a, 0xca, 0xf4, 0x40,
+-	0x2f, 0xd0, 0xd0, 0x1e, 0x7a, 0xe8, 0x4c, 0x06, 0xc3, 0x1a, 0x33, 0xb6, 0x05, 0x59, 0xc9, 0x99,
+-	0xb8, 0x17, 0x8d, 0x90, 0xd6, 0x42, 0x63, 0xa1, 0x55, 0xa5, 0x25, 0x0d, 0xbd, 0xf5, 0xda, 0x7f,
+-	0xa9, 0x7f, 0x58, 0xaf, 0x9d, 0xd5, 0x2f, 0x03, 0xae, 0x93, 0x4e, 0x4e, 0xe8, 0x7b, 0xef, 0xdb,
+-	0xef, 0xfd, 0xda, 0x87, 0x04, 0x2f, 0x03, 0xc6, 0xc2, 0x9e, 0xb5, 0x30, 0x5d, 0xdf, 0xe2, 0x36,
+-	0x33, 0xa2, 0x85, 0xbb, 0xec, 0x06, 0x21, 0x17, 0x1c, 0xef, 0xc7, 0x3f, 0x51, 0xb3, 0xb9, 0x43,
+-	0x61, 0x1f, 0x98, 0x2f, 0x12, 0x4e, 0xf3, 0x38, 0xf6, 0x05, 0x21, 0x0f, 0x78, 0x64, 0x7a, 0xa9,
+-	0xf1, 0x1b, 0x87, 0x73, 0xc7, 0x63, 0xbd, 0x18, 0xcd, 0x57, 0x77, 0x3d, 0xe1, 0x2e, 0x59, 0x24,
+-	0xcc, 0x65, 0x90, 0x10, 0xda, 0x7f, 0x97, 0x01, 0x0d, 0x33, 0xbd, 0x6b, 0x16, 0x45, 0xa6, 0xc3,
+-	0xf0, 0x6b, 0x28, 0x89, 0x75, 0xc0, 0x1a, 0x85, 0x56, 0xa1, 0x53, 0xef, 0xbf, 0x4a, 0xa8, 0x51,
+-	0x77, 0x97, 0xd7, 0xd5, 0xd7, 0x01, 0xa3, 0x31, 0x15, 0xff, 0x0c, 0xd5, 0x5c, 0xba, 0xb1, 0xd7,
+-	0x2a, 0x74, 0x6a, 0xfd, 0x66, 0x37, 0x09, 0xde, 0xcd, 0x82, 0x77, 0xf5, 0x8c, 0x41, 0x1f, 0xc8,
+-	0xb8, 0x01, 0x95, 0xc0, 0x5c, 0x7b, 0xdc, 0xb4, 0x1b, 0xc5, 0x56, 0xa1, 0x73, 0x40, 0x33, 0x88,
+-	0x31, 0x94, 0xc4, 0x47, 0xd7, 0x6e, 0x94, 0x5a, 0x85, 0x4e, 0x95, 0xc6, 0xcf, 0xb8, 0x0f, 0x4a,
+-	0x56, 0x62, 0xa3, 0x1c, 0x87, 0x39, 0xcd, 0xd2, 0xd3, 0x5c, 0xc7, 0x67, 0xf6, 0x2c, 0xf5, 0xd2,
+-	0x9c, 0x87, 0xdf, 0xc0, 0xd1, 0x4e, 0xcb, 0x1a, 0xfb, 0xdb, 0x47, 0xf3, 0xca, 0x88, 0xf4, 0xd2,
+-	0xba, 0xb5, 0x85, 0xf1, 0x2b, 0x00, 0x6b, 0x61, 0xfa, 0x3e, 0xf3, 0x0c, 0xd7, 0x6e, 0x54, 0xe2,
+-	0x74, 0xaa, 0xa9, 0x65, 0x62, 0xb7, 0xff, 0xd9, 0x83, 0x92, 0x6c, 0x05, 0x3e, 0x84, 0xea, 0x8d,
+-	0x3a, 0x22, 0xe7, 0x13, 0x95, 0x8c, 0xd0, 0x33, 0x7c, 0x00, 0x0a, 0x25, 0xe3, 0x89, 0xa6, 0x13,
+-	0x8a, 0x0a, 0xb8, 0x0e, 0x90, 0x21, 0x32, 0x42, 0x7b, 0x58, 0x81, 0xd2, 0x44, 0x9d, 0xe8, 0xa8,
+-	0x88, 0xab, 0x50, 0xa6, 0x64, 0x30, 0xba, 0x45, 0x25, 0x7c, 0x04, 0x35, 0x9d, 0x0e, 0x54, 0x6d,
+-	0x30, 0xd4, 0x27, 0x53, 0x15, 0x95, 0xa5, 0xe4, 0x70, 0x7a, 0x3d, 0xbb, 0x22, 0x3a, 0x19, 0xa1,
+-	0x7d, 0x49, 0x25, 0x94, 0x4e, 0x29, 0xaa, 0x48, 0xcf, 0x98, 0xe8, 0x86, 0xa6, 0x0f, 0x74, 0x82,
+-	0x14, 0x09, 0x67, 0x37, 0x19, 0xac, 0x4a, 0x38, 0x22, 0x57, 0x29, 0x04, 0xfc, 0x02, 0xd0, 0x44,
+-	0x7d, 0x37, 0xbd, 0x24, 0xc6, 0xf0, 0x62, 0x30, 0x51, 0x87, 0xd3, 0x11, 0x41, 0xb5, 0x24, 0x41,
+-	0x6d, 0x36, 0x55, 0x35, 0x82, 0x0e, 0xf1, 0x29, 0xe0, 0x5c, 0xd0, 0x38, 0xbb, 0x35, 0xe8, 0x40,
+-	0x1d, 0x13, 0x54, 0x97, 0x67, 0xa5, 0xfd, 0xed, 0x0d, 0xa1, 0xb7, 0x06, 0x25, 0xda, 0xcd, 0x95,
+-	0x8e, 0x8e, 0xa4, 0x35, 0xb1, 0x24, 0x7c, 0x95, 0xbc, 0xd7, 0x11, 0xc2, 0x27, 0xf0, 0x7c, 0xd3,
+-	0x3a, 0xbc, 0x9a, 0x6a, 0x04, 0x3d, 0x97, 0xd9, 0x5c, 0x12, 0x32, 0x1b, 0x5c, 0x4d, 0xde, 0x11,
+-	0x84, 0xf1, 0x57, 0x70, 0x2c, 0x15, 0x2f, 0x26, 0x9a, 0x3e, 0xa5, 0xb7, 0xc6, 0xf9, 0x94, 0x1a,
+-	0x97, 0xe4, 0x16, 0x1d, 0x6f, 0xa7, 0x70, 0x4d, 0xf4, 0xc1, 0x68, 0xa0, 0x0f, 0xd0, 0x0b, 0x69,
+-	0xcf, 0x8b, 0x7b, 0xb0, 0x9f, 0xb4, 0x7f, 0x01, 0x65, 0xcc, 0x84, 0x26, 0x4c, 0xc1, 0x30, 0x82,
+-	0xe2, 0x3d, 0x5b, 0xc7, 0x77, 0xb6, 0x4a, 0xe5, 0x23, 0xfe, 0x1a, 0xc0, 0xe2, 0x9e, 0xc7, 0x2c,
+-	0xe1, 0x72, 0x3f, 0xbe, 0x94, 0x55, 0xba, 0x61, 0x69, 0x8f, 0x00, 0x65, 0xa7, 0xaf, 0x99, 0x30,
+-	0x6d, 0x53, 0x98, 0x5f, 0xa0, 0x42, 0x41, 0x99, 0xad, 0x9e, 0xcc, 0xe1, 0x05, 0x94, 0x3f, 0x98,
+-	0xde, 0x8a, 0xc5, 0x07, 0x0f, 0x68, 0x02, 0x76, 0x34, 0x8b, 0x8f, 0x34, 0x7f, 0x07, 0x94, 0x69,
+-	0xfe, 0xef, 0xcc, 0x1e, 0xa9, 0xe0, 0xd7, 0xa0, 0x2c, 0xd3, 0xd3, 0xf1, 0x0e, 0xd5, 0xfa, 0x27,
+-	0xf9, 0xae, 0x6c, 0x4a, 0xd3, 0x9c, 0x26, 0x1b, 0x3a, 0x62, 0xde, 0x97, 0x36, 0xf4, 0xcf, 0x02,
+-	0x1c, 0x65, 0x1d, 0x3d, 0x5b, 0x53, 0xd3, 0x77, 0x18, 0x6e, 0x82, 0x12, 0x09, 0x33, 0x14, 0x97,
+-	0xb9, 0x54, 0x8e, 0xf1, 0x29, 0xec, 0x33, 0xdf, 0x96, 0x9e, 0x44, 0x2b, 0x45, 0x9f, 0x2d, 0xac,
+-	0xb9, 0x53, 0xd8, 0xc1, 0x46, 0x05, 0x73, 0xa8, 0x8f, 0x99, 0x78, 0xbb, 0x62, 0xe1, 0x9a, 0xb2,
+-	0x68, 0xe5, 0x09, 0x39, 0x82, 0xdf, 0x24, 0x4c, 0xc3, 0x27, 0xe0, 0x73, 0xb5, 0x6c, 0xc5, 0x28,
+-	0xee, 0xc4, 0x18, 0xc3, 0x61, 0x1c, 0x20, 0x9f, 0x4d, 0x13, 0x94, 0xc0, 0x74, 0x98, 0xe6, 0xfe,
+-	0x91, 0xfc, 0x69, 0x96, 0x69, 0x8e, 0xa5, 0x6f, 0xce, 0xf9, 0xfd, 0xd2, 0x0c, 0xef, 0xd3, 0x30,
+-	0x39, 0x6e, 0x7f, 0x17, 0xdf, 0xc0, 0x0b, 0x37, 0x12, 0x3c, 0x5c, 0x9f, 0xf3, 0x50, 0x16, 0xff,
+-	0xa8, 0xed, 0xed, 0x16, 0xd4, 0xe3, 0x70, 0x71, 0x5f, 0x55, 0xf6, 0x51, 0xe0, 0x3a, 0xec, 0xb9,
+-	0x76, 0x4a, 0xd9, 0x73, 0xed, 0xf6, 0xb7, 0x70, 0xf4, 0xc0, 0x18, 0x7a, 0x3c, 0x62, 0x8f, 0x28,
+-	0x3f, 0x01, 0xda, 0x68, 0xca, 0xd9, 0x5a, 0xb0, 0x08, 0xb7, 0xa0, 0x16, 0x3e, 0xc0, 0x98, 0x7c,
+-	0x40, 0x37, 0x4d, 0xed, 0xbf, 0x0a, 0x69, 0xa9, 0x94, 0x45, 0x01, 0xf7, 0x23, 0x86, 0xfb, 0x50,
+-	0x49, 0x08, 0x92, 0x5f, 0xec, 0xd4, 0xfa, 0x8d, 0xec, 0x4e, 0xed, 0xca, 0xd3, 0x8c, 0x88, 0x5f,
+-	0x82, 0xb2, 0x30, 0x23, 0x63, 0xc9, 0xc3, 0x64, 0x0f, 0x14, 0x5a, 0x59, 0x98, 0xd1, 0x35, 0x0f,
+-	0xb3, 0x34, 0x8b, 0x59, 0x9a, 0x9f, 0x1c, 0xad, 0x03, 0x27, 0x5b, 0xb9, 0xe4, 0xed, 0xef, 0xc3,
+-	0xc9, 0x1d, 0x13, 0xd6, 0x82, 0xd9, 0x46, 0xc8, 0x2c, 0x1e, 0xda, 0x91, 0x61, 0xf1, 0x95, 0x2f,
+-	0xd2, 0x59, 0x1c, 0xa7, 0x4e, 0x9a, 0xf8, 0x86, 0xd2, 0xf5, 0xc9, 0xb1, 0xbc, 0x81, 0xc3, 0xed,
+-	0xdd, 0x6b, 0x40, 0x45, 0x66, 0xf1, 0x30, 0x97, 0x0c, 0xfe, 0xf7, 0x7e, 0xb7, 0xcf, 0xe1, 0x78,
+-	0x7b, 0xc3, 0x92, 0x9b, 0xd8, 0x83, 0x0a, 0xf3, 0x45, 0xe8, 0xb2, 0xac, 0x77, 0x4f, 0xec, 0x63,
+-	0xc6, 0xea, 0xbf, 0xdf, 0x78, 0x39, 0x6b, 0xab, 0x20, 0xe0, 0xa1, 0xc0, 0x23, 0x50, 0x28, 0x73,
+-	0xdc, 0x48, 0xb0, 0x10, 0x37, 0x9e, 0x7a, 0x35, 0x37, 0x9f, 0xf4, 0xb4, 0x9f, 0x75, 0x0a, 0x3f,
+-	0x14, 0xce, 0xa6, 0xd0, 0xe6, 0xa1, 0xd3, 0x5d, 0xac, 0x03, 0x16, 0x7a, 0xcc, 0x76, 0x58, 0xd8,
+-	0xbd, 0x33, 0xe7, 0xa1, 0x6b, 0x65, 0xe7, 0xe4, 0xd7, 0xc4, 0xaf, 0xdf, 0x3b, 0xae, 0x58, 0xac,
+-	0xe6, 0x5d, 0x8b, 0x2f, 0x7b, 0x1b, 0xd4, 0x5e, 0x42, 0x4d, 0xbe, 0x2a, 0xa2, 0x9e, 0xa4, 0xce,
+-	0x93, 0x4f, 0x94, 0x1f, 0xff, 0x0d, 0x00, 0x00, 0xff, 0xff, 0x41, 0xbd, 0x1a, 0x01, 0xc6, 0x08,
+-	0x00, 0x00,
++	proto.RegisterFile("peer/chaincode_shim.proto", fileDescriptor_chaincode_shim_d860978fd7e69f07)
++}
++
++var fileDescriptor_chaincode_shim_d860978fd7e69f07 = []byte{
++	// 1063 bytes of a gzipped FileDescriptorProto
++	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x9c, 0x56, 0xcd, 0x73, 0xda, 0x46,
++	0x14, 0x0f, 0x06, 0x8c, 0x78, 0xd8, 0x78, 0xb3, 0xfe, 0x28, 0x61, 0x26, 0x2d, 0xd5, 0xf4, 0x40,
++	0x2f, 0xd0, 0xd0, 0x1e, 0x7a, 0xe8, 0x4c, 0x86, 0x8f, 0x35, 0x66, 0x6c, 0x03, 0x59, 0xc9, 0x49,
++	0xdc, 0x8b, 0x46, 0x48, 0x6b, 0xd0, 0x58, 0x68, 0x55, 0x69, 0x49, 0x43, 0x6f, 0xbd, 0xf6, 0xd4,
++	0x3f, 0xae, 0x7f, 0x50, 0x67, 0xf5, 0x65, 0xc0, 0x75, 0xd2, 0xc9, 0xc9, 0xfa, 0xbd, 0xf7, 0xdb,
++	0xdf, 0xfb, 0xda, 0x67, 0x16, 0x5e, 0xf8, 0x8c, 0x05, 0x6d, 0x6b, 0x61, 0x3a, 0x9e, 0xc5, 0x6d,
++	0x66, 0x84, 0x0b, 0x67, 0xd9, 0xf2, 0x03, 0x2e, 0x38, 0xde, 0x8f, 0xfe, 0x84, 0xf5, 0xfa, 0x0e,
++	0x85, 0x7d, 0x60, 0x9e, 0x88, 0x39, 0xf5, 0xe3, 0xc8, 0xe7, 0x07, 0xdc, 0xe7, 0xa1, 0xe9, 0x26,
++	0xc6, 0x6f, 0xe6, 0x9c, 0xcf, 0x5d, 0xd6, 0x8e, 0xd0, 0x6c, 0x75, 0xd7, 0x16, 0xce, 0x92, 0x85,
++	0xc2, 0x5c, 0xfa, 0x31, 0x41, 0xfd, 0xa7, 0x08, 0xa8, 0x9f, 0xea, 0x5d, 0xb3, 0x30, 0x34, 0xe7,
++	0x0c, 0xbf, 0x82, 0x82, 0x58, 0xfb, 0xac, 0x96, 0x6b, 0xe4, 0x9a, 0xd5, 0xce, 0xcb, 0x98, 0x1a,
++	0xb6, 0x76, 0x79, 0x2d, 0x7d, 0xed, 0x33, 0x1a, 0x51, 0xf1, 0xcf, 0x50, 0xce, 0xa4, 0x6b, 0x7b,
++	0x8d, 0x5c, 0xb3, 0xd2, 0xa9, 0xb7, 0xe2, 0xe0, 0xad, 0x34, 0x78, 0x4b, 0x4f, 0x19, 0xf4, 0x81,
++	0x8c, 0x6b, 0x50, 0xf2, 0xcd, 0xb5, 0xcb, 0x4d, 0xbb, 0x96, 0x6f, 0xe4, 0x9a, 0x07, 0x34, 0x85,
++	0x18, 0x43, 0x41, 0x7c, 0x74, 0xec, 0x5a, 0xa1, 0x91, 0x6b, 0x96, 0x69, 0xf4, 0x8d, 0x3b, 0xa0,
++	0xa4, 0x25, 0xd6, 0x8a, 0x51, 0x98, 0xb3, 0x34, 0x3d, 0xcd, 0x99, 0x7b, 0xcc, 0x9e, 0x26, 0x5e,
++	0x9a, 0xf1, 0xf0, 0x6b, 0x38, 0xda, 0x69, 0x59, 0x6d, 0x7f, 0xfb, 0x68, 0x56, 0x19, 0x91, 0x5e,
++	0x5a, 0xb5, 0xb6, 0x30, 0x7e, 0x09, 0x60, 0x2d, 0x4c, 0xcf, 0x63, 0xae, 0xe1, 0xd8, 0xb5, 0x52,
++	0x94, 0x4e, 0x39, 0xb1, 0x8c, 0x6c, 0xf5, 0xef, 0x3c, 0x14, 0x64, 0x2b, 0xf0, 0x21, 0x94, 0x6f,
++	0xc6, 0x03, 0x72, 0x3e, 0x1a, 0x93, 0x01, 0x7a, 0x86, 0x0f, 0x40, 0xa1, 0x64, 0x38, 0xd2, 0x74,
++	0x42, 0x51, 0x0e, 0x57, 0x01, 0x52, 0x44, 0x06, 0x68, 0x0f, 0x2b, 0x50, 0x18, 0x8d, 0x47, 0x3a,
++	0xca, 0xe3, 0x32, 0x14, 0x29, 0xe9, 0x0e, 0x6e, 0x51, 0x01, 0x1f, 0x41, 0x45, 0xa7, 0xdd, 0xb1,
++	0xd6, 0xed, 0xeb, 0xa3, 0xc9, 0x18, 0x15, 0xa5, 0x64, 0x7f, 0x72, 0x3d, 0xbd, 0x22, 0x3a, 0x19,
++	0xa0, 0x7d, 0x49, 0x25, 0x94, 0x4e, 0x28, 0x2a, 0x49, 0xcf, 0x90, 0xe8, 0x86, 0xa6, 0x77, 0x75,
++	0x82, 0x14, 0x09, 0xa7, 0x37, 0x29, 0x2c, 0x4b, 0x38, 0x20, 0x57, 0x09, 0x04, 0x7c, 0x02, 0x68,
++	0x34, 0x7e, 0x3b, 0xb9, 0x24, 0x46, 0xff, 0xa2, 0x3b, 0x1a, 0xf7, 0x27, 0x03, 0x82, 0x2a, 0x71,
++	0x82, 0xda, 0x74, 0x32, 0xd6, 0x08, 0x3a, 0xc4, 0x67, 0x80, 0x33, 0x41, 0xa3, 0x77, 0x6b, 0xd0,
++	0xee, 0x78, 0x48, 0x50, 0x55, 0x9e, 0x95, 0xf6, 0x37, 0x37, 0x84, 0xde, 0x1a, 0x94, 0x68, 0x37,
++	0x57, 0x3a, 0x3a, 0x92, 0xd6, 0xd8, 0x12, 0xf3, 0xc7, 0xe4, 0xbd, 0x8e, 0x10, 0x3e, 0x85, 0xe7,
++	0x9b, 0xd6, 0xfe, 0xd5, 0x44, 0x23, 0xe8, 0xb9, 0xcc, 0xe6, 0x92, 0x90, 0x69, 0xf7, 0x6a, 0xf4,
++	0x96, 0x20, 0x8c, 0xbf, 0x82, 0x63, 0xa9, 0x78, 0x31, 0xd2, 0xf4, 0x09, 0xbd, 0x35, 0xce, 0x27,
++	0xd4, 0xb8, 0x24, 0xb7, 0xe8, 0x78, 0x3b, 0x85, 0x6b, 0xa2, 0x77, 0x07, 0x5d, 0xbd, 0x8b, 0x4e,
++	0xa4, 0x3d, 0x2b, 0xee, 0xc1, 0x7e, 0x2a, 0x85, 0xb2, 0xee, 0x18, 0xef, 0xe8, 0x48, 0x27, 0xbd,
++	0x6e, 0xff, 0x12, 0x9d, 0xa9, 0xbf, 0x80, 0x32, 0x64, 0x42, 0x13, 0xa6, 0x60, 0x18, 0x41, 0xfe,
++	0x9e, 0xad, 0xa3, 0xcb, 0x5c, 0xa6, 0xf2, 0x13, 0x7f, 0x0d, 0x60, 0x71, 0xd7, 0x65, 0x96, 0x70,
++	0xb8, 0x17, 0xdd, 0xd6, 0x32, 0xdd, 0xb0, 0xa8, 0x03, 0x40, 0xe9, 0xe9, 0x6b, 0x26, 0x4c, 0xdb,
++	0x14, 0xe6, 0x17, 0xa8, 0x50, 0x50, 0xa6, 0xab, 0x27, 0x73, 0x38, 0x81, 0xe2, 0x07, 0xd3, 0x5d,
++	0xb1, 0xe8, 0xe0, 0x01, 0x8d, 0xc1, 0x8e, 0x66, 0xfe, 0x91, 0xe6, 0xef, 0x80, 0x52, 0xcd, 0xff,
++	0x9d, 0xd9, 0x23, 0x15, 0xfc, 0x0a, 0x94, 0x65, 0x72, 0x3a, 0x5a, 0xae, 0x4a, 0xe7, 0x34, 0x5b,
++	0xa2, 0x4d, 0x69, 0x9a, 0xd1, 0x64, 0x43, 0x07, 0xcc, 0xfd, 0xd2, 0x86, 0xfe, 0x99, 0x83, 0xa3,
++	0xb4, 0xa3, 0xbd, 0x35, 0x35, 0xbd, 0x39, 0xc3, 0x75, 0x50, 0x42, 0x61, 0x06, 0xe2, 0x32, 0x93,
++	0xca, 0x30, 0x3e, 0x83, 0x7d, 0xe6, 0xd9, 0xd2, 0x13, 0x6b, 0x25, 0xe8, 0xb3, 0x85, 0xd5, 0x77,
++	0x0a, 0x3b, 0xd8, 0xa8, 0x60, 0x06, 0xd5, 0x21, 0x13, 0x6f, 0x56, 0x2c, 0x58, 0x53, 0x16, 0xae,
++	0x5c, 0x21, 0x47, 0xf0, 0x9b, 0x84, 0x49, 0xf8, 0x18, 0x7c, 0xae, 0x96, 0xad, 0x18, 0xf9, 0x9d,
++	0x18, 0x43, 0x38, 0x8c, 0x02, 0x64, 0xb3, 0xa9, 0x83, 0xe2, 0x9b, 0x73, 0xa6, 0x39, 0x7f, 0xc4,
++	0xff, 0x4d, 0x8b, 0x34, 0xc3, 0xd2, 0x37, 0xe3, 0xfc, 0x7e, 0x69, 0x06, 0xf7, 0x49, 0x98, 0x0c,
++	0xab, 0xdf, 0x45, 0x37, 0xf0, 0xc2, 0x09, 0x05, 0x0f, 0xd6, 0xe7, 0x3c, 0x90, 0xc5, 0x3f, 0x6a,
++	0xbb, 0xda, 0x80, 0x6a, 0x14, 0x2e, 0xea, 0xeb, 0x98, 0x7d, 0x14, 0xb8, 0x0a, 0x7b, 0x8e, 0x9d,
++	0x50, 0xf6, 0x1c, 0x5b, 0xfd, 0x16, 0x8e, 0x1e, 0x18, 0x7d, 0x97, 0x87, 0xec, 0x11, 0xe5, 0x27,
++	0x40, 0x1b, 0x4d, 0xe9, 0xad, 0x05, 0x0b, 0x71, 0x03, 0x2a, 0xc1, 0x03, 0x8c, 0xc8, 0x07, 0x74,
++	0xd3, 0xa4, 0xfe, 0x95, 0x4b, 0x4a, 0xa5, 0x2c, 0xf4, 0xb9, 0x17, 0x32, 0xdc, 0x81, 0x52, 0x4c,
++	0x90, 0xfc, 0x7c, 0xb3, 0xd2, 0xa9, 0xa5, 0x77, 0x6a, 0x57, 0x9e, 0xa6, 0x44, 0xfc, 0x02, 0x94,
++	0x85, 0x19, 0x1a, 0x4b, 0x1e, 0xc4, 0x7b, 0xa0, 0xd0, 0xd2, 0xc2, 0x0c, 0xaf, 0x79, 0x90, 0xa6,
++	0x99, 0x4f, 0xd3, 0xfc, 0xe4, 0x68, 0xe7, 0x70, 0xba, 0x95, 0x4b, 0xd6, 0xfe, 0x0e, 0x9c, 0xde,
++	0x31, 0x61, 0x2d, 0x98, 0x6d, 0x04, 0xcc, 0xe2, 0x81, 0x1d, 0x1a, 0x16, 0x5f, 0x79, 0x22, 0x99,
++	0xc5, 0x71, 0xe2, 0xa4, 0xb1, 0xaf, 0x2f, 0x5d, 0x9f, 0x1c, 0xcb, 0x6b, 0x38, 0xdc, 0xde, 0xbd,
++	0x1a, 0x94, 0x64, 0x16, 0x0f, 0x73, 0x49, 0xe1, 0x7f, 0xef, 0xb7, 0x7a, 0x0e, 0xc7, 0xdb, 0x1b,
++	0x16, 0xdf, 0xc4, 0x36, 0x94, 0x98, 0x27, 0x02, 0x87, 0xa5, 0xbd, 0x7b, 0x62, 0x1f, 0x53, 0x96,
++	0x6a, 0x03, 0xee, 0xf3, 0xa5, 0xef, 0x32, 0xc1, 0xec, 0x77, 0x81, 0x23, 0x58, 0xcf, 0xb4, 0xee,
++	0x65, 0xea, 0x41, 0xd2, 0x82, 0x64, 0x66, 0x19, 0x96, 0xe3, 0x59, 0xf9, 0xb6, 0x29, 0xc7, 0xb9,
++	0xb7, 0x3d, 0x9e, 0xdd, 0x9f, 0x75, 0x9a, 0x12, 0x3b, 0xef, 0x37, 0xde, 0x06, 0xda, 0xca, 0xf7,
++	0x79, 0x20, 0xf0, 0x00, 0x14, 0xca, 0xe6, 0x4e, 0x28, 0x58, 0x80, 0x9f, 0x94, 0xa8, 0x3f, 0xe9,
++	0x51, 0x9f, 0x35, 0x73, 0x3f, 0xe4, 0x7a, 0x13, 0x50, 0x79, 0x30, 0x6f, 0x2d, 0xd6, 0x3e, 0x0b,
++	0x5c, 0x66, 0xcf, 0x59, 0xd0, 0xba, 0x33, 0x67, 0x81, 0x63, 0xa5, 0xe7, 0xe4, 0x63, 0xe6, 0xd7,
++	0xef, 0xe7, 0x8e, 0x58, 0xac, 0x66, 0x2d, 0x8b, 0x2f, 0xdb, 0x1b, 0xd4, 0x76, 0x4c, 0x8d, 0x1f,
++	0x35, 0x61, 0x5b, 0x52, 0x67, 0xf1, 0x0b, 0xe9, 0xc7, 0x7f, 0x03, 0x00, 0x00, 0xff, 0xff, 0xff,
++	0xea, 0x12, 0xe5, 0x45, 0x09, 0x00, 0x00,
+ }
+diff --git a/protos/peer/chaincode_shim.proto b/protos/peer/chaincode_shim.proto
+index 85a0e0c12..848a9193c 100644
+--- a/protos/peer/chaincode_shim.proto
++++ b/protos/peer/chaincode_shim.proto
+@@ -38,6 +38,7 @@ message ChaincodeMessage {
+         GET_HISTORY_FOR_KEY = 19;
+         GET_STATE_METADATA = 20;
+         PUT_STATE_METADATA = 21;
++        COMPLETED_WRITEBACK = 22;
+     }
+ 
+     Type type = 1;
+@@ -173,6 +174,11 @@ message StateMetadataResult {
+     repeated StateMetadata entries = 1;
+ }
+ 
++message CompletedWriteBack {
++    bytes response = 1;
++    repeated ChaincodeMessage updates = 2;
++}
++
+ // Interface that provides support to chaincode execution. ChaincodeContext
+ // provides the context necessary for the server to respond appropriately.
+ service ChaincodeSupport {
+-- 
+2.17.2 (Apple Git-113)
+
