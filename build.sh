@@ -8,7 +8,7 @@ tag=${1:-dev}
 branch=${2:-release-1.4}
 base=${3:-0.4.14-dev}
 
-targets="orderer peer ccenv"
+targets="orderer peer ccenv baseos tools"
 
 export GOPATH=$PWD/go
 
@@ -29,7 +29,7 @@ for t in $targets; do
 done
 rm -f .build/goshim.tar.bz2
 
-make_targets=$(echo $targets | sed -E 's/(peer|orderer)/\1-docker/g')
+make_targets=$(echo $targets | sed -E 's/(peer|orderer|tools)/\1-docker/g')
 
 make BASEIMAGE_RELEASE="$base" $make_targets || exit 1
 
@@ -37,6 +37,8 @@ for t in $targets; do
   id=$(docker image ls --format '{{ .ID }}' "hyperledger/fabric-$t:latest" )
   docker tag "hyperledger/fabric-$t:latest" "hyperledger/fabric-$t:$tag"
   if [[ -n "$id" ]]; then
-    docker image ls --format '{{ .ID }} {{ .Repository }} {{ .Tag }}' | awk "\$1 == \"$id\" && \$3 != \"$tag\" { print(\$2 \":\" \$3) }" | xargs $(xargs --version > /dev/null 2>&1 && echo -e --no-run-if-empty) docker image rm
+    #docker image ls --format '{{ .ID }} {{ .Repository }} {{ .Tag }}' | awk "\$1 == \"$id\" && \$3 != \"$tag\" { print(\$2 \":\" \$3) }" | xargs $(xargs --version > /dev/null 2>&1 && echo -e --no-run-if-empty) docker image rm
+    docker image ls --format '{{ .ID }} {{ .Repository }} {{ .Tag }}' | awk "\$1 == \"$id\" && \$3 != \"$tag\" && ( \$3 == \"latest\" || \$3 ~ /snapshot/) { print(\$2 \":\" \$3) }" | xargs $(xargs --version > /dev/null 2>&1 && echo -e --no-run-if-empty) docker image rm
+
   fi
 done
