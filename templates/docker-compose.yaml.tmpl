@@ -149,6 +149,7 @@ services:
       {{ network }}:
 
   alertmanager:
+    container_name: alertmanager
     image: prom/alertmanager
     ports:
       - 9093:9093
