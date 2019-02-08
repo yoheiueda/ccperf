@@ -1,14 +1,13 @@
-commit c55e1c1a0809b7b7ef120adead23aaebb7a2a842
+commit fa295fd3a1dfd85d50a83b7c6b00c9bf4130ec4c
 Author: Yohei Ueda <yohei@jp.ibm.com>
-Date:   Thu Feb 7 15:58:46 2019 +0900
+Date:   Fri Feb 8 18:27:21 2019 +0900
 
     WIP: Prototype LSCC cache
     
-    Change-Id: I17ef1dde308c301587d6a54e2f6e7fb4633be387
     Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
 
 diff --git a/core/scc/lscc/lscc.go b/core/scc/lscc/lscc.go
-index 60622c2cd..aad19bdc9 100644
+index 60622c2cd..88925bb47 100644
 --- a/core/scc/lscc/lscc.go
 +++ b/core/scc/lscc/lscc.go
 @@ -9,6 +9,7 @@ package lscc
@@ -29,7 +28,7 @@ index 60622c2cd..aad19bdc9 100644
  }
  
  // New creates a new instance of the LSCC
-@@ -161,8 +165,30 @@ func (lscc *LifeCycleSysCC) InvokableExternal() bool   { return true }
+@@ -161,8 +165,43 @@ func (lscc *LifeCycleSysCC) InvokableExternal() bool   { return true }
  func (lscc *LifeCycleSysCC) InvokableCC2CC() bool      { return true }
  func (lscc *LifeCycleSysCC) Enabled() bool             { return true }
  
@@ -42,7 +41,20 @@ index 60622c2cd..aad19bdc9 100644
 +	return nil
 +}
 +
-+func (lscc *LifeCycleSysCC) getCache(chaincodeName string, qe ledger.SimpleQueryExecutor) ([]byte, error) {
++func (lscc *LifeCycleSysCC) getCache(chaincodeName string, stub shim.ChaincodeStubInterface) ([]byte, error) {
++
++	entry, ok := lscc.cache.Load(chaincodeName)
++	if ok {
++		bytes, ok := entry.([]byte)
++		if !ok {
++			return nil, errors.Errorf("Unknown data type %s in LSCC cache", chaincodeName)
++		}
++		return bytes, nil
++	}
++	return stub.GetState(chaincodeName)
++}
++
++func (lscc *LifeCycleSysCC) getCacheLedger(chaincodeName string, qe ledger.SimpleQueryExecutor) ([]byte, error) {
 +
 +	entry, ok := lscc.cache.Load(chaincodeName)
 +	if ok {
@@ -57,29 +69,29 @@ index 60622c2cd..aad19bdc9 100644
 +
  func (lscc *LifeCycleSysCC) ChaincodeContainerInfo(chaincodeName string, qe ledger.SimpleQueryExecutor) (*ccprovider.ChaincodeContainerInfo, error) {
 -	chaincodeDataBytes, err := qe.GetState("lscc", chaincodeName)
-+	chaincodeDataBytes, err := lscc.getCache(chaincodeName, qe)
++	chaincodeDataBytes, err := lscc.getCacheLedger(chaincodeName, qe)
  	if err != nil {
  		return nil, errors.Wrapf(err, "could not retrieve state for chaincode %s", chaincodeName)
  	}
-@@ -183,7 +209,7 @@ func (lscc *LifeCycleSysCC) ChaincodeContainerInfo(chaincodeName string, qe ledg
+@@ -183,7 +222,7 @@ func (lscc *LifeCycleSysCC) ChaincodeContainerInfo(chaincodeName string, qe ledg
  }
  
  func (lscc *LifeCycleSysCC) ChaincodeDefinition(chaincodeName string, qe ledger.SimpleQueryExecutor) (ccprovider.ChaincodeDefinition, error) {
 -	chaincodeDataBytes, err := qe.GetState("lscc", chaincodeName)
-+	chaincodeDataBytes, err := lscc.getCache(chaincodeName, qe)
++	chaincodeDataBytes, err := lscc.getCacheLedger(chaincodeName, qe)
  	if err != nil {
  		return nil, errors.Wrapf(err, "could not retrieve state for chaincode %s", chaincodeName)
  	}
-@@ -208,7 +234,7 @@ func (lscc *LifeCycleSysCC) ChaincodeDefinition(chaincodeName string, qe ledger.
+@@ -208,7 +247,7 @@ func (lscc *LifeCycleSysCC) ChaincodeDefinition(chaincodeName string, qe ledger.
  // unexpected error is not nil and mark the transaction as invalid if the validation error
  // is not nil.
  func (lscc *LifeCycleSysCC) ValidationInfo(chaincodeName string, qe ledger.QueryExecutor) (plugin string, args []byte, unexpectedErr error, validationErr error) {
 -	chaincodeDataBytes, err := qe.GetState("lscc", chaincodeName)
-+	chaincodeDataBytes, err := lscc.getCache(chaincodeName, qe)
++	chaincodeDataBytes, err := lscc.getCacheLedger(chaincodeName, qe)
  	if err != nil {
  		// failure to access the ledger is clearly an unexpected
  		// error since we expect the ledger to be reachable
-@@ -248,7 +274,7 @@ func (lscc *LifeCycleSysCC) putChaincodeData(stub shim.ChaincodeStubInterface, c
+@@ -248,7 +287,7 @@ func (lscc *LifeCycleSysCC) putChaincodeData(stub shim.ChaincodeStubInterface, c
  		return MarshallErr(cd.Name)
  	}
  
@@ -88,3 +100,12 @@ index 60622c2cd..aad19bdc9 100644
  
  	return err
  }
+@@ -387,7 +426,7 @@ func (lscc *LifeCycleSysCC) getChaincodeCollectionData(stub shim.ChaincodeStubIn
+ 
+ //checks for existence of chaincode on the given channel
+ func (lscc *LifeCycleSysCC) getCCInstance(stub shim.ChaincodeStubInterface, ccname string) ([]byte, error) {
+-	cdbytes, err := stub.GetState(ccname)
++	cdbytes, err := lscc.getCache(ccname, stub)
+ 	if err != nil {
+ 		return nil, TXNotFoundErr(err.Error())
+ 	}
