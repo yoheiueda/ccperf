@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const sdk = require('fabric-client');
 const sdkutil = require('fabric-client/lib/utils.js');
+const util = require('util');
 const sprintf = require('sprintf-js').sprintf;
 const yaml = require('js-yaml');
 const request = require('request');
@@ -14,8 +15,11 @@ const logger = require('winston');
 if (process.env.FABRIC_CONFIG_LOGLEVEL) {
     logger.level = process.env.FABRIC_CONFIG_LOGLEVEL;
 }
-function loadFile(path) {
-    return fs.readFileSync(path, 'utf8');
+function loadFile(filePath, baseDir) {
+    if (!path.isAbsolute(filePath) && baseDir !== undefined) {
+        filePath = path.join(baseDir, filePath);
+    }
+    return fs.readFileSync(filePath, 'utf8');
 }
 
 class MemoryKeyValueStore {
@@ -44,21 +48,18 @@ async function getClient(profile, orgName) {
     const cryptoKeyStore = sdk.newCryptoKeyStore(MemoryKeyValueStore, {})
     cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
 
-    process.chdir(path.dirname(profile));
-    const client = sdk.loadFromConfig(path.basename(profile));
+    const client = sdk.loadFromConfig(profile);
 
     client.setCryptoSuite(cryptoSuite);
     const newStore = await new MemoryKeyValueStore();
     client.setStateStore(newStore);
 
-    const config = yaml.safeLoad(loadFile(profile));
-
-    const org = config.organizations[orgName];
+    const org = profile.organizations[orgName];
 
     const userOpts = {
         username: "admin",
         mspid: org.mspid,
-        cryptoContent: { signedCertPEM: loadFile(org.signedCert.path), privateKeyPEM: loadFile(org.adminPrivateKey.path) },
+        cryptoContent: { signedCertPEM: org.signedCert.pem, privateKeyPEM: org.adminPrivateKey.pem },
         skipPersistence: false
     };
 
@@ -108,12 +109,11 @@ function doRequest(options) {
     });
 }
 
-async function master(profile, channelID, logdir, processes, rampup, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population, endorsingOrgs, ordererSelection, grafana) {
-    const cwd1 = process.cwd();
-    const client = await getClient(profile, orgName)
-    const channel = client.getChannel(channelID);
+async function master(config) {
+    const client = await getClient(config.profile, config.orgName)
+    const channel = client.getChannel(config.channelID);
 
-    if (population) {
+    if (config.population) {
         const peer_name = channel.getPeers()[0].getName();
         const eventhub = channel.getChannelEventHub(peer_name);
         eventhub.connect(false);
@@ -128,7 +128,7 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
         const request = {
             chaincodeId: 'ccperf',
             fcn: 'populate',
-            args: ['0', String(population), String(size)],
+            args: ['0', String(config.population), String(config.size)],
             txId: tx_id
         };
 
@@ -150,20 +150,20 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
 
     const start = Date.now() + 5000;
 
-    if (grafana) {
-        const description = sprintf("Target:%d Processes:%d Duration:%d Type:%s Num:%d Size:%d", 1000 / interval * processes, processes, duration, type, num, size);
+    if (config.grafana) {
+        const description = util.format("Target:%d Processes:%d Duration:%d Type:%s Num:%d Size:%d", 1000 / config.interval * config.processes, config.processes, config.duration, config.type, config.num, config.size);
 
         const payload = {
             "dashboardId": 2,
             "time": start,
             "isRegion": true,
-            "timeEnd": start + duration,
+            "timeEnd": start + config.duration,
             "tags": [],
             "text": description
         }
 
         const requestOptions = {
-            url: grafana,
+            url: config.grafana,
             method: "POST",
             headers: {
                 "Content-type": "application/json",
@@ -171,13 +171,7 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
             json: payload
         }
 
-        console.log(requestOptions);
-
-        const res = await doRequest(requestOptions).catch(err => {
-            console.log(err);
-            process.exit(1);
-        });
-        console.log(res);
+        const res = await doRequest(requestOptions).catch(err => { throw new Error(err) });
     }
 
     let prev_t = 0;
@@ -187,14 +181,14 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
     let eventhub;
     let blocksLog;
     let blocksLogFirst = true;
-    if (committingPeerName) {
-        if (logdir) {
-            const blocksLogPath = logdir + '/blocks.json';
+    if (config.committingPeerName) {
+        if (config.logdir) {
+            const blocksLogPath = config.logdir + '/blocks.json';
             blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
             blocksLog.write('[\n');
         }
 
-        eventhub = channel.getChannelEventHub(committingPeerName);
+        eventhub = channel.getChannelEventHub(config.committingPeerName);
         eventhub.connect(false);
         blockRegNum = eventhub.registerBlockEvent(
             (block) => {
@@ -238,7 +232,7 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
                 const tps = count / (now - prev_t) * 1000;
                 console.error(sprintf('Block %d contains %d transaction(s). TPS is %.2f', block.number, count, tps));
 
-                if (logdir) {
+                if (config.logdir) {
                     if (blocksLogFirst) {
                         blocksLogFirst = false;
                     } else {
@@ -255,9 +249,6 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
         );
     }
 
-    const cwd2 = process.cwd();
-    process.chdir(cwd1);
-
     const txTable = {};
 
     cluster.on('message', (w, txStats) => {
@@ -268,30 +259,37 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
 
     const promises = [];
 
-    for (var i = 0; i < processes; i++) {
-        const delay = i * rampup / processes;
-        cluster.setupMaster({
-            args: [profile, channelID, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection]
+    for (var i = 0; i < config.processes; i++) {
+        config.delay = i * config.rampup / config.processes;
+        const w = cluster.fork();
+        w.on('online', () => {
+            w.send({ config: config });
         });
 
-        const w = cluster.fork();
-
-        promises.push(new Promise(resolve => w.on('exit', resolve)));
+        promises.push(new Promise((resolve, reject) => {
+            w.on('exit', (code, signal) => {
+                if (signal) {
+                    reject(`Worker ${w.id} is killed by ${signal}`);
+                } else if (code != 0) {
+                    reject(`Worker ${w.id} exited with return code ${code}`);
+                } else {
+                    resolve();
+                }
+            });
+        }));
     }
 
     await Promise.all(promises);
     await sleep(3000);
 
-    process.chdir(cwd2);
-
     // info = await channel.queryInfo();
     // height = Number(info.height)
     // block = await channel.queryBlock(height-1);
 
-    if (committingPeerName) {
+    if (config.committingPeerName) {
         eventhub.unregisterBlockEvent(blockRegNum);
         eventhub.disconnect();
-        if (logdir) {
+        if (config.logdir) {
             blocksLog.write('\n]\n');
             blocksLog.close();
         }
@@ -385,16 +383,16 @@ async function master(profile, channelID, logdir, processes, rampup, duration, i
 
 const handlerTable = {
     'putstate': {
-        'genArgs': info => [String(info.num), String(info.size), sprintf('key_mychannel_org1_0_%d_%d', info.workerID, info.index)]
+        'genArgs': info => [String(info.num), String(info.size), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index)]
     },
     'getstate': {
-        'genArgs': info => [String(info.num), String(info.population), sprintf('key_mychannel_org1_0_%d_%d', info.workerID, info.index)]
+        'genArgs': info => [String(info.num), String(info.population), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index)]
     },
     'mix': {
-        'genArgs': info => [String(info.num), String(info.size), sprintf('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
+        'genArgs': info => [String(info.num), String(info.size), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
     },
     'json': {
-        'genArgs': info => [String(info.num), String(info.size), sprintf('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
+        'genArgs': info => [String(info.num), String(info.size), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
     }
 }
 
@@ -461,26 +459,20 @@ async function execute(info) {
     info.index += 1;
 }
 
-async function worker(profile, channelID, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection) {
-    const client = await getClient(profile, orgName);
+async function worker(config) {
+    const client = await getClient(config.profile, config.orgName);
     let peers;
-    if (endorsingPeerName && endorsingPeerName != 'undefined') {
+    if (config.endorsingPeerName) {
         peers = [client.getPeer(endorsingPeerName)];
     }
-    if (channelID === 'undefined') {
-        channelID = undefined;
-    }
-    const channel = client.getChannel(channelID);
+    const channel = client.getChannel(config.channelID);
     const txStats = {};
-    const genArgs = handlerTable[type].genArgs;
-    const genTransientMap = handlerTable[type].genTransientMap;
+    const genArgs = handlerTable[config.type].genArgs;
+    const genTransientMap = handlerTable[config.type].genTransientMap;
 
-    if (logdir == 'undefined') {
-        logdir = undefined;
-    }
     let requestsLog;
-    if (logdir) {
-        const requestsLogPath = logdir + '/requests-' + cluster.worker.id + '.json';
+    if (config.logdir) {
+        const requestsLogPath = config.logdir + '/requests-' + cluster.worker.id + '.json';
         requestsLog = fs.createWriteStream(requestsLogPath, { flags: 'wx' });
         requestsLog.write('[\n');
     }
@@ -491,10 +483,10 @@ async function worker(profile, channelID, logdir, start, duration, interval, del
         peers: peers,
         txStats: txStats,
         workerID: cluster.worker.id,
-        type: type,
-        num: num,
-        size: size,
-        population: population,
+        type: config.type,
+        num: config.num,
+        size: config.size,
+        population: config.population,
         index: 0,
         genArgs: genArgs,
         requestsLog: requestsLog
@@ -502,29 +494,27 @@ async function worker(profile, channelID, logdir, start, duration, interval, del
 
     if (peers) {
         info.peers = peers;
-    } else if (endorsingOrgs) {
-        const orgs = endorsingOrgs.split(',');
+    } else if (config.endorsingOrgs) {
+        const orgs = config.endorsingOrgs;
         peers = []
         for (org of orgs) {
-            const orgPeers = client.getPeersForOrg(org);
+            const orgPeers = client.getPeersForOrg(profile.organizations[org].mspid);
             peers.push(orgPeers[info.workerID % orgPeers.length]);
         }
         info.peers = peers;
     }
 
-    if (ordererSelection && ordererSelection != 'undefined') {
-        if (ordererSelection == 'balance') {
-            const orderers = channel.getOrderers();
-            const orderer = orderers[cluster.worker.id % orderers.length];
-            info.orderer = orderer.getName();
-        }
+    if (config.ordererSelection == 'balance') {
+        const orderers = channel.getOrderers();
+        const orderer = orderers[cluster.worker.id % orderers.length];
+        info.orderer = orderer.getName();
     }
 
     if (genTransientMap) {
         info.genTransientMap = genTransientMap;
     }
 
-    const wait = start + delay - Date.now();
+    const wait = config.start + config.delay - Date.now();
     if (wait > 0) {
         await sleep(wait);
     }
@@ -533,13 +523,13 @@ async function worker(profile, channelID, logdir, start, duration, interval, del
     //await sleep(duration);
     //clearInterval(timeout);
 
-    const end = Date.now() + duration;
+    const end = Date.now() + config.duration;
     let behind = 0;
     while (true) {
         const before = Date.now();
         execute(info);
         const after = Date.now();
-        const remaining = interval - (after - before) - behind;
+        const remaining = config.interval - (after - before) - behind;
         if (remaining > 0) {
             behind = 0;
             await sleep(remaining);
@@ -557,7 +547,7 @@ async function worker(profile, channelID, logdir, start, duration, interval, del
         process.send(txStats, null, {}, resolve);
     });
 
-    if (logdir) {
+    if (config.logdir) {
         requestsLog.write('\n]\n');
         requestsLog.close();
     }
@@ -569,42 +559,135 @@ function sleep(msec) {
     return new Promise(resolve => setTimeout(resolve, msec));
 }
 
-async function run(cmd) {
-    const profile = cmd.profile;
-    const channelID = cmd.channelID;
-    const logdir = cmd.logdir;
-    const processes = cmd.processes;
-    const target = cmd.target;
-    const orgName = cmd.org;
-    const endorsingPeerName = cmd.endorsingPeer;
-    const committingPeerName = cmd.committingPeer;
-    const type = cmd.type;
-    const num = cmd.num;
-    const size = cmd.size;
-    const population = cmd.population;
-    const endorsingOrgs = cmd.endorsingOrgs;
-    const ordererSelection = cmd.ordererSelection;
-    const grafana = cmd.grafana;
+function loadConnectionProfile(filePath) {
+    const baseDir = path.dirname(filePath);
+    const profile = yaml.safeLoad(loadFile(filePath));
 
+    function path2pem(key) {
+        if (key !== undefined && key.path !== undefined && key.pem === undefined) {
+            const pem = loadFile(key.path, baseDir);
+            key.pem = pem;
+            delete key.path;
+        }
+    }
+
+    for (const name of Object.keys(profile.organizations)) {
+        const org = profile.organizations[name];
+        path2pem(org.signedCert);
+        path2pem(org.adminPrivateKey);
+    }
+    for (const name of Object.keys(profile.orderers)) {
+        const orderer = profile.orderers[name];
+        path2pem(orderer.tlsCACerts);
+    }
+    for (const name of Object.keys(profile.peers)) {
+        const peer = profile.peers[name];
+        path2pem(peer.tlsCACerts);
+    }
+
+    return profile;
+}
+
+function run(cmd) {
+    const profilePath = cmd.profile === undefined ? "./connection-profile.yaml" : cmd.profile;
+    const profile = loadConnectionProfile(profilePath);
+
+    const processes = cmd.processes === undefined ? 1 : Number(cmd.processes);
+    const target = cmd.target === undefined ? 1 : Number(cmd.target);
     const duration = 1000.0 * cmd.duration;
     const tps = target / processes;
     const interval = 1000.0 / tps
-    let rampup = interval;
-    if (cmd.rampup) {
-        rampup = Number(cmd.rampup);
+    const rampup = cmd.rampup === undefined ? interval : 1000.0 * Number(cmd.rampup);
+
+    let channelID = cmd.channelID
+    if (channelID === undefined) {
+        if (profile.channels !== undefined) {
+            channelID = Object.keys(profile.channels)[0]
+        }
+        if (channelID === undefined) {
+            throw new Error("No channel is defined in connection profile");
+        }
+    } else if (profile.channels === undefined || profile.channels[channelID] === undefined) {
+        throw new Error(util.format("%s: channel is not defined in connection profile", channelID));
+    }
+    if (profile.organizations === undefined || Object.keys(profile.organizations).length === 0) {
+        throw new Error("No valid organization is defined in connection profile");
+    }
+    if (profile.channels[channelID].peers === undefined || Object.keys(profile.channels[channelID].peers).length === 0) {
+        throw new Error(util.format("No valid peer is defined for %s in connection profile", channelID));
+    }
+    if (profile.channels[channelID].orderers === undefined || Object.keys(profile.channels[channelID].orderers).length === 0) {
+        throw new Error(util.format("No valid orderer is defined for %s in connection profile", channelID));
     }
 
-    //console.log('interval=%f', interval);
-    await master(profile, channelID, logdir, processes, rampup, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population, endorsingOrgs, ordererSelection, grafana);
+    const endorsingPeers = Object.entries(profile.channels[channelID].peers).filter(([name, peer]) => peer.endorsingPeer === true).map(([name, peer]) => name);
+    let endorsingOrgs = Object.entries(profile.organizations).filter(([name, org]) => org.peers.reduce((flag, peerName) => flag || endorsingPeers.includes(peerName), false)).map(([name, org]) => name);
+    if (cmd.endorsingOrgs !== undefined) {
+        const orgs = cmd.endorsingOrgs.split(',');
+        if (orgs.length == 0 || orgs.filter(name => endorsingOrgs.includes(name)).length < orgs.length) {
+            throw new Error("Invalid --endorsingOrgs option");
+        }
+        endorsingOrgs = orgs;
+    }
 
+    let orgName = cmd.org;
+    if (orgName === undefined) {
+        orgName = endorsingOrgs[0];
+    } else if (!endorsingOrgs.includes(orgName)) {
+        throw new Error(util.format("%s: not a valid organization for endorsing in %s", orgName, channelID));
+    }
+    const config = {
+        profile: profile,
+        channelID: cmd.channelID,
+        logdir: cmd.logdir,
+        processes: processes,
+        target: target,
+        orgName: orgName,
+        endorsingOrgs: cmd.endorsingOrgs === undefined ? undefined : cmd.endorsingOrgs.split(','),
+        peerSelection: cmd.peerSelection,
+        ordererSelection: cmd.ordererSelection,
+        committingPeerName: cmd.committingPeer,
+        type: cmd.type,
+        num: cmd.num === undefined ? 1 : Number(cmd.num),
+        size: cmd.size === undefined ? 1 : Number(cmd.size),
+        population: cmd.population === undefined ? undefined : Number(cmd.population),
+        grafana: cmd.grafana,
+        duration: duration,
+        interval: interval,
+        rampup: rampup
+    };
+
+    master(config).catch(err => {
+        console.error(err);
+        process.exit(1);
+    });
 }
 
 function main() {
-
     if (!cluster.isMaster) {
-        const [profile, channelID, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection] = process.argv.slice(2);
-        worker(profile, channelID, logdir, Number(start), Number(duration), Number(interval), Number(delay), orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection);
-        return;
+        cluster.worker.on('disconnect', () => {
+            console.error('Worker %d: Master process prematurely disconnected', cluster.worker.id);
+            process.exit(1);
+        });
+
+        const promise = new Promise((resolve, reject) => {
+            cluster.worker.on('message', msg => {
+                if (msg !== undefined && msg.config !== undefined) {
+                    resolve(msg.config)
+                } else {
+                    reject('Worker process receives an unknown mesasge from master process');
+                }
+            });
+        });
+
+        return promise.then(config => {
+            return worker(config);
+        }).then(() => {
+            return cluster.disconnect();
+        }).catch(err => {
+            console.error('Worker %d: ', cluster.worker.id, err);
+            process.exit(1);
+        });
     }
 
     program.command('run')
@@ -620,7 +703,6 @@ function main() {
         .option('--num [number]', "Number of operations per transaction")
         .option('--size [bytes]', "Payload size of a PutState call")
         .option('--population [number]', "Number of prepopulated key-values")
-        .option('--endorsing-peer [name]', "Peer name to which transaction proposals are sent")
         .option('--committing-peer [name]', "Peer name whose commit events are monitored ")
         .option('--endorsing-orgs [org1,org2]', 'Comma-separated list of organizations')
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
@@ -629,4 +711,4 @@ function main() {
     program.parse(process.argv);
 }
 
-main();
+main()
