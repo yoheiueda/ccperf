@@ -108,10 +108,10 @@ function doRequest(options) {
     });
 }
 
-async function master(profile, logdir, processes, rampup, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population, endorsingOrgs, ordererSelection, grafana) {
+async function master(profile, channelID, logdir, processes, rampup, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population, endorsingOrgs, ordererSelection, grafana) {
     const cwd1 = process.cwd();
     const client = await getClient(profile, orgName)
-    const channel = client.getChannel()
+    const channel = client.getChannel(channelID);
 
     if (population) {
         const peer_name = channel.getPeers()[0].getName();
@@ -271,7 +271,7 @@ async function master(profile, logdir, processes, rampup, duration, interval, or
     for (var i = 0; i < processes; i++) {
         const delay = i * rampup / processes;
         cluster.setupMaster({
-            args: [profile, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection]
+            args: [profile, channelID, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection]
         });
 
         const w = cluster.fork();
@@ -461,13 +461,16 @@ async function execute(info) {
     info.index += 1;
 }
 
-async function worker(profile, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection) {
+async function worker(profile, channelID, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection) {
     const client = await getClient(profile, orgName);
     let peers;
     if (endorsingPeerName && endorsingPeerName != 'undefined') {
         peers = [client.getPeer(endorsingPeerName)];
     }
-    const channel = client.getChannel();
+    if (channelID === 'undefined') {
+        channelID = undefined;
+    }
+    const channel = client.getChannel(channelID);
     const txStats = {};
     const genArgs = handlerTable[type].genArgs;
     const genTransientMap = handlerTable[type].genTransientMap;
@@ -568,6 +571,7 @@ function sleep(msec) {
 
 async function run(cmd) {
     const profile = cmd.profile;
+    const channelID = cmd.channelID;
     const logdir = cmd.logdir;
     const processes = cmd.processes;
     const target = cmd.target;
@@ -591,15 +595,15 @@ async function run(cmd) {
     }
 
     //console.log('interval=%f', interval);
-    await master(profile, logdir, processes, rampup, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population, endorsingOrgs, ordererSelection, grafana);
+    await master(profile, channelID, logdir, processes, rampup, duration, interval, orgName, endorsingPeerName, committingPeerName, type, num, size, population, endorsingOrgs, ordererSelection, grafana);
 
 }
 
 function main() {
 
     if (!cluster.isMaster) {
-        const [profile, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection] = process.argv.slice(2);
-        worker(profile, logdir, Number(start), Number(duration), Number(interval), Number(delay), orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection);
+        const [profile, channelID, logdir, start, duration, interval, delay, orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection] = process.argv.slice(2);
+        worker(profile, channelID, logdir, Number(start), Number(duration), Number(interval), Number(delay), orgName, endorsingPeerName, type, num, size, population, endorsingOrgs, ordererSelection);
         return;
     }
 
@@ -607,6 +611,7 @@ function main() {
         .option('--logdir [dir]', "Directory name where log files are stored")
         .option('--processes [number]', "Number of processes to be launched")
         .option('--profile [path]', "Connection profile")
+        .option('--channelID [channel]', "Channel name")
         .option('--target [number]', "Target input TPS")
         .option('--rampup [number]', "Rampup in second")
         .option('--duration [number]', "Duration in second")
