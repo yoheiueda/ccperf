@@ -383,35 +383,35 @@ async function master(config) {
 
 const handlerTable = {
     'putstate': {
-        'genArgs': info => [String(info.num), String(info.size), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index)]
+        'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
     },
     'getstate': {
-        'genArgs': info => [String(info.num), String(info.population), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index)]
+        'genArgs': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
     },
     'mix': {
-        'genArgs': info => [String(info.num), String(info.size), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
+        'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
     },
     'json': {
-        'genArgs': info => [String(info.num), String(info.size), util.format('key_mychannel_org1_0_%d_%d', info.workerID, info.index), String(info.population)]
+        'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
     }
 }
 
-async function execute(info) {
-    const client = info.client;
-    const channel = info.channel;
-    const txStats = info.txStats;
+async function execute(context) {
+    const client = context.client;
+    const channel = context.channel;
+    const txStats = context.txStats;
 
     const tx_id = client.newTransactionID();
 
     const request = {
-        targets: info.peers,
+        targets: context.peers,
         chaincodeId: 'ccperf',
-        fcn: info.type,
-        args: info.genArgs(info),
+        fcn: context.config.type,
+        args: context.genArgs(context),
         txId: tx_id
     };
-    if (info.genTransientMap) {
-        request.transientMap = info.genTransientMap(info);
+    if (context.genTransientMap) {
+        request.transientMap = context.genTransientMap(context);
     }
 
     const t1 = new Date();
@@ -440,8 +440,8 @@ async function execute(info) {
         proposal: proposal,
     };
 
-    if (info.orderer) {
-        orderer_request.orderer = info.orderer;
+    if (context.orderer) {
+        orderer_request.orderer = context.orderer;
     }
 
     orderer_results = await channel.sendTransaction(orderer_request);
@@ -449,22 +449,18 @@ async function execute(info) {
     const t3 = new Date();
 
     txStats[tx_id.getTransactionID()] = [t1.getTime(), t2.getTime(), t3.getTime()];
-    if (info.requestsLog) {
-        if (info.index > 0) {
-            info.requestsLog.write(',\n');
+    if (context.requestsLog) {
+        if (context.index > 0) {
+            context.requestsLog.write(',\n');
         }
-        info.requestsLog.write(JSON.stringify({ txid: tx_id.getTransactionID(), peer: [{ submission: t1, response: t2 }], orderer: { submission: t2, response: t3 } }, undefined, 4));
+        context.requestsLog.write(JSON.stringify({ txid: tx_id.getTransactionID(), peer: [{ submission: t1, response: t2 }], orderer: { submission: t2, response: t3 } }, undefined, 4));
     }
 
-    info.index += 1;
+    context.index += 1;
 }
 
 async function worker(config) {
     const client = await getClient(config.profile, config.orgName);
-    let peers;
-    if (config.endorsingPeerName) {
-        peers = [client.getPeer(endorsingPeerName)];
-    }
     const channel = client.getChannel(config.channelID);
     const txStats = {};
     const genArgs = handlerTable[config.type].genArgs;
@@ -477,41 +473,38 @@ async function worker(config) {
         requestsLog.write('[\n');
     }
 
-    const info = {
-        client: client,
-        channel: channel,
-        peers: peers,
-        txStats: txStats,
-        workerID: cluster.worker.id,
-        type: config.type,
-        num: config.num,
-        size: config.size,
-        population: config.population,
-        index: 0,
-        genArgs: genArgs,
-        requestsLog: requestsLog
-    };
-
-    if (peers) {
-        info.peers = peers;
+    let peers;
+    if (config.endorsingPeerName) {
+        peers = [client.getPeer(endorsingPeerName)];
     } else if (config.endorsingOrgs) {
         const orgs = config.endorsingOrgs;
         peers = []
         for (org of orgs) {
             const orgPeers = client.getPeersForOrg(profile.organizations[org].mspid);
-            peers.push(orgPeers[info.workerID % orgPeers.length]);
+            peers.push(orgPeers[context.workerID % orgPeers.length]);
         }
-        info.peers = peers;
     }
+
+    const context = {
+        config: config,
+        client: client,
+        channel: channel,
+        peers: peers,
+        txStats: txStats,
+        workerID: cluster.worker.id,
+        index: 0,
+        genArgs: genArgs,
+        requestsLog: requestsLog
+    };
 
     if (config.ordererSelection == 'balance') {
         const orderers = channel.getOrderers();
         const orderer = orderers[cluster.worker.id % orderers.length];
-        info.orderer = orderer.getName();
+        context.orderer = orderer.getName();
     }
 
     if (genTransientMap) {
-        info.genTransientMap = genTransientMap;
+        context.genTransientMap = genTransientMap;
     }
 
     const wait = config.start + config.delay - Date.now();
@@ -527,7 +520,7 @@ async function worker(config) {
     let behind = 0;
     while (true) {
         const before = Date.now();
-        execute(info);
+        execute(context);
         const after = Date.now();
         const remaining = config.interval - (after - before) - behind;
         if (remaining > 0) {
@@ -708,6 +701,7 @@ function main() {
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
         .option('--grafana [url]', "Grafana endpoint URL ")
         .action(run);
+
     program.parse(process.argv);
 }
 
