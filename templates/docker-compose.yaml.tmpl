@@ -117,26 +117,26 @@ services:
   {{ zookeeper.name }}:
     container_name: {{ zookeeper.name }}
     hostname: {{ zookeeper.name }}
-    image: hyperledger/fabric-zookeeper:${BASE_VERSION}
+    image: hyperledger/fabric-zookeeper:${BASE_TAG}
     environment:
       - ZOO_MY_ID={{ zookeeper.id }}
       - ZOO_SERVERS={%- for z in zookeepers %}server.{{ z.id }}={{ z.name }}:2888:3888{% if not loop.last %} {% endif %}{% endfor %}
     {%- if zookeeper.volume %}
     volumes:
-      - /home/storage/coinapp/{{ zookeeper.name }}/data:/data
-      - /home/storage/coinapp/{{ zookeeper.name }}/datalog:/datalog
+      - {{ zookeeper.volume }}/data:/data
+      - {{ zookeeper.volume }}/datalog:/datalog
     {% endif %}
-    ports:
-      - '2181:2181'
-      - '2888:2888'
-      - '3888:3888'
+    #ports:
+    #  - '2181:2181'
+    #  - '2888:2888'
+    #  - '3888:3888'
     networks:
       {{ network }}:
   {%- endfor  %}
 
   {% for kafka in kafkas %}
   {{ kafka.name }}:
-    image: hyperledger/fabric-kafka:${BASE_VERSION}
+    image: hyperledger/fabric-kafka:${BASE_TAG}
     container_name: {{ kafka.name }}
     hostname: {{ kafka.name }}
     environment:
@@ -147,16 +147,16 @@ services:
       - KAFKA_LOG_RETENTION_MS=-1
       - KAFKA_PORT={{ kafka.port }}
       - KAFKA_BROKER_ID={{ kafka.id }}
-      - KAFKA_DEFAULT_REPLICATION_FACTOR=4
-      - KAFKA_MIN_INSYNC_REPLICAS=3
+      - KAFKA_DEFAULT_REPLICATION_FACTOR=3
+      - KAFKA_MIN_INSYNC_REPLICAS=2
       - KAFKA_BROKER_RACK={{ kafka.rack }}
       - KAFKA_ZOOKEEPER_CONNECT={%- for z in zookeepers %}{{ z.name }}:2181{% if not loop.last %},{% endif %}{% endfor %}
     {%- if kafka.volume %}
     volumes:
-      - /home/storage/coinapp/{{ kafka.name }}/kafka-logs:/tmp/kafka-logs
+      - {{ kafka.volume }}/kafka-logs:/tmp/kafka-logs
     {% endif %}
-    ports:
-      - {{ kafka.port }}:{{ kafka.port }}
+    #ports:
+    #  - {{ kafka.port }}:{{ kafka.port }}
     networks:
       {{ network }}:
   {%- endfor  %}
