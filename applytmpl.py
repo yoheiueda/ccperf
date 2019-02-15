@@ -34,13 +34,12 @@ data = {
         'name': 'orderer',
         'mspid': 'OrdererOrg',
         'domain': commonDomain,
-        'type': 'etcdraft',
+        #'type': 'etcdraft',
         #'type': 'kafka',
+        'type': 'solo',
         'orderers': [
-            {'name': 'orderer1', 'host': commonHostname,
-                'ports': {'requests': 7050, 'pprof': 7060}},
-            {'name': 'orderer2', 'host': commonHostname,
-                'ports': {'requests': 7150, 'pprof': 7160}},
+            {'name': 'orderer1', 'host': commonHostname, 'ports': {'requests': 7050, 'pprof': 7060}},
+            #{'name': 'orderer2', 'host': commonHostname, 'ports': {'requests': 7150, 'pprof': 7160}},
         ]
     },
     'orgs': [
