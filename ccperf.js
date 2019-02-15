@@ -10,6 +10,7 @@ const util = require('util');
 const sprintf = require('sprintf-js').sprintf;
 const yaml = require('js-yaml');
 const request = require('request');
+const WebSocket = require('ws');
 
 const logger = require('winston');
 if (process.env.FABRIC_CONFIG_LOGLEVEL) {
@@ -338,6 +339,77 @@ async function printMetrics(blockTable, txTable) {
     }
 }
 
+async function invokeLocalWorkers(config, txTable, ws) {
+    const promises = [];
+
+    const numProcesses = config.processes / config.remotes.length;
+
+    for (var i = 0; i < numProcesses; i++) {
+        config.delay = i * config.rampup / numProcesses;
+        const w = cluster.fork();
+        w.on('online', () => {
+            w.send({ config: config });
+        });
+        if (txTable) {
+            w.on('message', (txStats) => {
+                for (const txid in txStats) {
+                    txTable[txid] = txStats[txid];
+                }
+            });
+        } else {
+            w.on('message', (txStats) => {
+                const message = {
+                    txStats: txStats
+                }
+                try {
+                    ws.send(JSON.stringify(message));
+                } catch (err) {
+                    console.error(err);
+                }
+            });
+        }
+
+        promises.push(new Promise(resolve => w.on('disconnect', resolve)));
+
+        promises.push(new Promise((resolve, reject) => {
+            w.on('exit', (code, signal) => {
+                if (signal) {
+                    reject(`Worker ${w.id} is killed by ${signal}`);
+                } else if (code != 0) {
+                    reject(`Worker ${w.id} exited with return code ${code}`);
+                } else {
+                    resolve();
+                }
+            });
+        }));
+    }
+
+    return Promise.all(promises);
+}
+
+async function invokeRemoteWorkers(config, remote, txTable) {
+    const hostport = remote.split(':');
+    const host = hostport[0];
+    const port = Number(hostport[1]);
+    const url = `ws://${host}:${port}`;
+
+    const ws = new WebSocket(url);
+
+    ws.on('message', message => {
+        const json = JSON.parse(message);
+        const txStats = json.txStats;
+        for (const txid in txStats) {
+            txTable[txid] = txStats[txid];
+        }
+    });
+
+    await new Promise(resolve => ws.on('open', resolve));
+
+    ws.send(JSON.stringify({ command: 'start', config: config }));
+
+    return new Promise(resolve => ws.on('close', resolve));
+}
+
 async function master(config) {
     const client = await getClient(config.profile, config.orgName)
     const channel = client.getChannel(config.channelID);
@@ -360,35 +432,19 @@ async function master(config) {
 
     const txTable = {};
 
-    cluster.on('message', (w, txStats) => {
-        for (const txid in txStats) {
-            txTable[txid] = txStats[txid];
-        }
-    });
-
     const promises = [];
-
-    for (var i = 0; i < config.processes; i++) {
-        config.delay = i * config.rampup / config.processes;
-        const w = cluster.fork();
-        w.on('online', () => {
-            w.send({ config: config });
-        });
-
-        promises.push(new Promise((resolve, reject) => {
-            w.on('exit', (code, signal) => {
-                if (signal) {
-                    reject(`Worker ${w.id} is killed by ${signal}`);
-                } else if (code != 0) {
-                    reject(`Worker ${w.id} exited with return code ${code}`);
-                } else {
-                    resolve();
-                }
-            });
-        }));
+    for (const remote of config.remotes) {
+        let promise;
+        if (remote === "local") {
+            promise = invokeLocalWorkers(config, txTable);
+        } else {
+            promise = invokeRemoteWorkers(config, remote, txTable);
+        }
+        promises.push(promise);
     }
 
     await Promise.all(promises);
+
     await sleep(3000);
 
     // info = await channel.queryInfo();
@@ -609,8 +665,8 @@ function run(cmd) {
     const profilePath = cmd.profile === undefined ? "./connection-profile.yaml" : cmd.profile;
     const profile = loadConnectionProfile(profilePath);
 
-    const processes = cmd.processes === undefined ? 1 : Number(cmd.processes);
-    const target = cmd.target === undefined ? 1 : Number(cmd.target);
+    let processes = cmd.processes === undefined ? 1 : Number(cmd.processes);
+    let target = cmd.target === undefined ? 1 : Number(cmd.target);
     const duration = 1000.0 * cmd.duration;
     const tps = target / processes;
     const interval = 1000.0 / tps
@@ -653,6 +709,12 @@ function run(cmd) {
     } else if (!endorsingOrgs.includes(orgName)) {
         throw new Error(util.format("%s: not a valid organization for endorsing in %s", orgName, channelID));
     }
+
+    let remotes = ["local"]
+    if (cmd.remote !== undefined) {
+        remotes = cmd.remote.split(',');
+    }
+
     const config = {
         profile: profile,
         channelID: cmd.channelID,
@@ -671,12 +733,39 @@ function run(cmd) {
         grafana: cmd.grafana,
         duration: duration,
         interval: interval,
-        rampup: rampup
+        rampup: rampup,
+        remotes: remotes
     };
 
     master(config).catch(err => {
         console.error(err);
         process.exit(1);
+    });
+}
+
+
+function daemon(cmd) {
+    if (cmd.port === undefined) {
+        console.error('Port number is not specified');
+        process.exit(1);
+    }
+    const port = Number(cmd.port);
+    console.log(`Listening on ${port}`);
+
+    const wss = new WebSocket.Server({ port: port });
+    wss.on('connection', function connection(ws) {
+        ws.on('message', function incoming(message) {
+            const json = JSON.parse(message);
+
+            switch (json.command) {
+                case 'start':
+                    const config = json.config;
+                    console.log('Start %d workers', json.config.processes);
+                    invokeLocalWorkers(config, null, ws).then(() => { ws.close() });
+                    break;
+            }
+        });
+        return;
     });
 }
 
@@ -724,7 +813,12 @@ function main() {
         .option('--endorsing-orgs [org1,org2]', 'Comma-separated list of organizations')
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
         .option('--grafana [url]', "Grafana endpoint URL ")
+        .option('--remote [hostport]', "Remote worker daemons. Comma-separated list of host:port or local")
         .action(run);
+
+    program.command('daemon')
+        .option('--port [port]', "Listen port number")
+        .action(daemon);
 
     program.parse(process.argv);
 }
