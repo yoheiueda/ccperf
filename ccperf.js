@@ -109,55 +109,53 @@ function doRequest(options) {
     });
 }
 
-async function master(config) {
+async function populate(config, channel) {
     const client = await getClient(config.profile, config.orgName)
     const channel = client.getChannel(config.channelID);
 
-    if (config.population) {
-        const peer_name = channel.getPeers()[0].getName();
-        const eventhub = channel.getChannelEventHub(peer_name);
-        eventhub.connect(false);
+    const peer_name = channel.getPeers()[0].getName();
+    const eventhub = channel.getChannelEventHub(peer_name);
+    eventhub.connect(false);
 
-        const tx_id = client.newTransactionID();
+    const tx_id = client.newTransactionID();
 
-        p = new Promise(resolve => eventhub.registerTxEvent(tx_id.getTransactionID(),
-            (txId, code, block_bumber) => resolve(txId),
-            err => console.error('EventHub error ', err),
-            { unregister: true }));
+    p = new Promise(resolve => eventhub.registerTxEvent(tx_id.getTransactionID(),
+        (txId, code, block_bumber) => resolve(txId),
+        err => console.error('EventHub error ', err),
+        { unregister: true }));
 
-        const request = {
-            chaincodeId: 'ccperf',
-            fcn: 'populate',
-            args: ['0', String(config.population), String(config.size)],
-            txId: tx_id
-        };
+    const request = {
+        chaincodeId: 'ccperf',
+        fcn: 'populate',
+        args: ['0', String(config.population), String(config.size)],
+        txId: tx_id
+    };
 
-        const results = await channel.sendTransactionProposal(request);
+    const results = await channel.sendTransactionProposal(request);
 
-        const proposalResponses = results[0];
-        const proposal = results[1];
-        const orderer_request = {
-            txId: tx_id,
-            proposalResponses: proposalResponses,
-            proposal: proposal
-        };
+    const proposalResponses = results[0];
+    const proposal = results[1];
+    const orderer_request = {
+        txId: tx_id,
+        proposalResponses: proposalResponses,
+        proposal: proposal
+    };
 
-        await channel.sendTransaction(orderer_request);
+    await channel.sendTransaction(orderer_request);
 
-        await p;
-        eventhub.disconnect();
-    }
+    await p;
+    eventhub.disconnect();
+}
 
-    const start = Date.now() + 5000;
-
+async function monitor(config, channel, blockTable, blocksLog) {
     if (config.grafana) {
         const description = util.format("Target:%d Processes:%d Duration:%d Type:%s Num:%d Size:%d", 1000 / config.interval * config.processes, config.processes, config.duration, config.type, config.num, config.size);
 
         const payload = {
             "dashboardId": 2,
-            "time": start,
+            "time": config.start,
             "isRegion": true,
-            "timeEnd": start + config.duration,
+            "timeEnd": config.start + config.duration,
             "tags": [],
             "text": description
         }
@@ -174,23 +172,16 @@ async function master(config) {
         const res = await doRequest(requestOptions).catch(err => { throw new Error(err) });
     }
 
-    let prev_t = 0;
-
-    const blockTable = {};
-    let blockRegNum;
-    let eventhub;
-    let blocksLog;
-    let blocksLogFirst = true;
     if (config.committingPeerName) {
-        if (config.logdir) {
-            const blocksLogPath = config.logdir + '/blocks.json';
-            blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
+        let blocksLogFirst = true;
+        if (blocksLog) {
             blocksLog.write('[\n');
         }
 
-        eventhub = channel.getChannelEventHub(config.committingPeerName);
+        const eventhub = channel.getChannelEventHub(config.committingPeerName);
         eventhub.connect(false);
-        blockRegNum = eventhub.registerBlockEvent(
+        let prev_t = 0;
+        config.blockRegNum = eventhub.registerBlockEvent(
             (block) => {
                 // Example data structure of a filtered block:
                 // {
@@ -210,7 +201,7 @@ async function master(config) {
                 const date = new Date();
                 const now = date.getTime();
                 if (prev_t == 0) {
-                    prev_t = start;
+                    prev_t = config.start;
                     return;
                 }
                 const txset = {}
@@ -232,7 +223,7 @@ async function master(config) {
                 const tps = count / (now - prev_t) * 1000;
                 console.error(sprintf('Block %d contains %d transaction(s). TPS is %.2f', block.number, count, tps));
 
-                if (config.logdir) {
+                if (blocksLog) {
                     if (blocksLogFirst) {
                         blocksLogFirst = false;
                     } else {
@@ -248,52 +239,18 @@ async function master(config) {
             }
         );
     }
+}
 
-    const txTable = {};
-
-    cluster.on('message', (w, txStats) => {
-        for (const txid in txStats) {
-            txTable[txid] = txStats[txid];
-        }
-    });
-
-    const promises = [];
-
-    for (var i = 0; i < config.processes; i++) {
-        config.delay = i * config.rampup / config.processes;
-        const w = cluster.fork();
-        w.on('online', () => {
-            w.send({ config: config });
-        });
-
-        promises.push(new Promise((resolve, reject) => {
-            w.on('exit', (code, signal) => {
-                if (signal) {
-                    reject(`Worker ${w.id} is killed by ${signal}`);
-                } else if (code != 0) {
-                    reject(`Worker ${w.id} exited with return code ${code}`);
-                } else {
-                    resolve();
-                }
-            });
-        }));
+async function unmonitor(config, channel, blocksLog) {
+    const eventhub = channel.getChannelEventHub(config.committingPeerName);
+    eventhub.unregisterBlockEvent(config.blockRegNum);
+    eventhub.disconnect();
+    if (config.logdir) {
+        blocksLog.write('\n]\n');
     }
+}
 
-    await Promise.all(promises);
-    await sleep(3000);
-
-    // info = await channel.queryInfo();
-    // height = Number(info.height)
-    // block = await channel.queryBlock(height-1);
-
-    if (config.committingPeerName) {
-        eventhub.unregisterBlockEvent(blockRegNum);
-        eventhub.disconnect();
-        if (config.logdir) {
-            blocksLog.write('\n]\n');
-            blocksLog.close();
-        }
-    }
+async function printMetrics(blockTable, txTable) {
 
     let min_t = Number.MAX_VALUE;
     let max_t = 0;
@@ -379,6 +336,73 @@ async function master(config) {
         s = sprintf('%(elapsed)8d %(peer.tps)8.2f %(orderer.tps)11.2f %(commit.tps)10.2f %(peer.avg)8.2f %(orderer.avg)11.2f %(commit.avg)10.2f %(peer.pctl)9.2f %(orderer.pctl)12.2f %(commit.pctl)11.2f', data);
         console.log('%s', s);
     }
+}
+
+async function master(config) {
+    const client = await getClient(config.profile, config.orgName)
+    const channel = client.getChannel(config.channelID);
+
+    if (config.population) {
+        await populate(config);
+    }
+
+    config.start = Date.now() + 5000;
+    const blockTable = {};
+
+    let blocksLog;
+    if (config.committingPeer || config.grafana) {
+        if (config.committingPeer && config.logdir) {
+            const blocksLogPath = config.logdir + '/blocks.json';
+            blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
+        }
+        await monitor(config, channel, blockTable, blocksLog);
+    }
+
+    const txTable = {};
+
+    cluster.on('message', (w, txStats) => {
+        for (const txid in txStats) {
+            txTable[txid] = txStats[txid];
+        }
+    });
+
+    const promises = [];
+
+    for (var i = 0; i < config.processes; i++) {
+        config.delay = i * config.rampup / config.processes;
+        const w = cluster.fork();
+        w.on('online', () => {
+            w.send({ config: config });
+        });
+
+        promises.push(new Promise((resolve, reject) => {
+            w.on('exit', (code, signal) => {
+                if (signal) {
+                    reject(`Worker ${w.id} is killed by ${signal}`);
+                } else if (code != 0) {
+                    reject(`Worker ${w.id} exited with return code ${code}`);
+                } else {
+                    resolve();
+                }
+            });
+        }));
+    }
+
+    await Promise.all(promises);
+    await sleep(3000);
+
+    // info = await channel.queryInfo();
+    // height = Number(info.height)
+    // block = await channel.queryBlock(height-1);
+
+    if (config.committingPeerName) {
+        await unmonitor(config, channel, blocksLog);
+    }
+    if (blocksLog) {
+        blocksLog.close();
+    }
+
+    await printMetrics(blockTable, txTable);
 }
 
 const handlerTable = {
