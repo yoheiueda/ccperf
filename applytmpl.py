@@ -15,9 +15,12 @@ else:
     genJSON = False
     tplfile = sys.argv[1]
 
+
 def findsk(org):
-    dir = 'crypto-config/peerOrganizations/' + org['domain'] + '/users/Admin@' + org['domain'] + '/msp/keystore'
+    dir = 'crypto-config/peerOrganizations/' + \
+        org['domain'] + '/users/Admin@' + org['domain'] + '/msp/keystore'
     return glob.glob(dir + '/*_sk')[0]
+
 
 env.filters['findsk'] = findsk
 tpl = env.get_template(tplfile)
@@ -28,21 +31,37 @@ commonHostname = 'localhost'
 data = {
     'network': 'ccperf',
     'ordererorg': {
-          'name': 'orderer',
-          'mspid': 'OrdererOrg',
-          'domain': commonDomain,
-          'orderers': [
-              { 'name': 'orderer1', 'host': commonHostname, 'ports': { 'requests':7050, 'pprof':7060 }},
-          ]
+        'name': 'orderer',
+        'mspid': 'OrdererOrg',
+        'domain': commonDomain,
+        'type': 'etcdraft',
+        #'type': 'kafka',
+        'orderers': [
+            {'name': 'orderer1', 'host': commonHostname,
+                'ports': {'requests': 7050, 'pprof': 7060}},
+            {'name': 'orderer2', 'host': commonHostname,
+                'ports': {'requests': 7150, 'pprof': 7160}},
+        ]
     },
     'orgs': [
-        {   'name': 'org1',
+        {'name': 'org1',
             'mspid': 'PeerOrg1',
             'domain': 'org1.' + commonDomain,
             'peers': [
-                { 'name': 'peer1', 'ports': { 'requests':7051, 'pprof':7061 }, 'host': commonHostname },
+                {'name': 'peer1', 'ports': {'requests': 7051,
+                                            'pprof': 7061}, 'host': commonHostname},
             ]
-        }
+         }
+    ],
+    'zookeepers': [
+        #{'id': '1', 'name': 'zookeeper1', 'port': 2181, 'host': commonHostname},
+        #{'id': '2', 'name': 'zookeeper2', 'port': 2281, 'host': commonHostname},
+        #{'id': '3', 'name': 'zookeeper3', 'port': 2381, 'host': commonHostname},
+    ],
+    'kafkas': [
+        #{'id': '1', 'name': 'kafka1', 'port': 9192, 'host': commonHostname},
+        #{'id': '2', 'name': 'kafka2', 'port': 9292, 'host': commonHostname},
+        #{'id': '3', 'name': 'kafka3', 'port': 9392, 'host': commonHostname},
     ],
     'grafana': {
         'port': 3000

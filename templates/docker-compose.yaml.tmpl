@@ -56,7 +56,7 @@ services:
       retries: 0
   {%- endfor  %}
   {%- for org in orgs -%}
-    {%- for peer in org.peers %}
+  {%- for peer in org.peers %}
 
   {{ org.name }}-{{ peer.name }}:
     container_name: {{ org.name }}-{{ peer.name }}
@@ -71,9 +71,14 @@ services:
       - CORE_PEER_ADDRESS={{ peer.name }}.{{ org.domain }}:7051
       - CORE_PEER_LISTENADDRESS=0.0.0.0:7051
       #- CORE_PEER_GOSSIP_BOOTSTRAP={{ peer.name }}.{{ org.domain }}:7051
-      - CORE_PEER_GOSSIP_EXTERNALENDPOINT={{ peer.name }}.{{ org.domain }}:7051
+      - CORE_PEER_GOSSIP_EXTERNALENDPOINT=peer1.{{ org.domain }}:7051
+      {% if peer.name == "peer1" %}
       - CORE_PEER_GOSSIP_USELEADERELECTION=false
       - CORE_PEER_GOSSIP_ORGLEADER=true
+      {% else %}
+      - CORE_PEER_GOSSIP_USELEADERELECTION=false
+      - CORE_PEER_GOSSIP_ORGLEADER=false
+      {% endif %}
       - CORE_VM_ENDPOINT=unix:///host/var/run/docker.sock
       - CORE_VM_DOCKER_HOSTCONFIG_NETWORKMODE=${COMPOSE_PROJECT_NAME}_{{ network }}
       - CORE_CHAINCODE_BUILDER=hyperledger/fabric-ccenv:${FABRIC_TAG}
@@ -105,8 +110,56 @@ services:
       interval: 5s
       timeout: 5s
       retries: 0
-    {%- endfor %}
   {%- endfor %}
+  {%- endfor %}
+
+  {% for zookeeper in zookeepers %}
+  {{ zookeeper.name }}:
+    container_name: {{ zookeeper.name }}
+    hostname: {{ zookeeper.name }}
+    image: hyperledger/fabric-zookeeper:${BASE_VERSION}
+    environment:
+      - ZOO_MY_ID={{ zookeeper.id }}
+      - ZOO_SERVERS={%- for z in zookeepers %}server.{{ z.id }}={{ z.name }}:2888:3888{% if not loop.last %} {% endif %}{% endfor %}
+    {%- if zookeeper.volume %}
+    volumes:
+      - /home/storage/coinapp/{{ zookeeper.name }}/data:/data
+      - /home/storage/coinapp/{{ zookeeper.name }}/datalog:/datalog
+    {% endif %}
+    ports:
+      - '2181:2181'
+      - '2888:2888'
+      - '3888:3888'
+    networks:
+      {{ network }}:
+  {%- endfor  %}
+
+  {% for kafka in kafkas %}
+  {{ kafka.name }}:
+    image: hyperledger/fabric-kafka:${BASE_VERSION}
+    container_name: {{ kafka.name }}
+    hostname: {{ kafka.name }}
+    environment:
+      #- KAFKA_SOCKET_REQUEST_MAX_BYTES=104857600 # 100 * 1024 * 1024 B
+      - KAFKA_MESSAGE_MAX_BYTES=103809024 # 99 * 1024 * 1024 B
+      - KAFKA_REPLICA_FETCH_MAX_BYTES=103809024 # 99 * 1024 * 1024 B
+      - KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE=false
+      - KAFKA_LOG_RETENTION_MS=-1
+      - KAFKA_PORT={{ kafka.port }}
+      - KAFKA_BROKER_ID={{ kafka.id }}
+      - KAFKA_DEFAULT_REPLICATION_FACTOR=4
+      - KAFKA_MIN_INSYNC_REPLICAS=3
+      - KAFKA_BROKER_RACK={{ kafka.rack }}
+      - KAFKA_ZOOKEEPER_CONNECT={%- for z in zookeepers %}{{ z.name }}:2181{% if not loop.last %},{% endif %}{% endfor %}
+    {%- if kafka.volume %}
+    volumes:
+      - /home/storage/coinapp/{{ kafka.name }}/kafka-logs:/tmp/kafka-logs
+    {% endif %}
+    ports:
+      - {{ kafka.port }}:{{ kafka.port }}
+    networks:
+      {{ network }}:
+  {%- endfor  %}
 
   node-exporter:
     image: prom/node-exporter

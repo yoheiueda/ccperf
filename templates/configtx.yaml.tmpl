@@ -28,6 +28,14 @@ Profiles:
                   ClientTLSCert: crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{ orderer.name }}.{{ ordererorg.domain }}/tls/server.crt
                   ServerTLSCert: crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{ orderer.name }}.{{ ordererorg.domain }}/tls/server.crt
                 {%- endfor %}
+            {% elif ordererorg.type == "kafka" %}
+            Kafka:
+                # Brokers: A list of Kafka brokers to which the orderer connects
+                # NOTE: Use IP:port notation
+                Brokers:
+                {%- for kafka in kafkas %}
+                    - {{ kafka.name }}:{{ kafka.port }}
+                {%- endfor %}
             {% endif %}
             BatchTimeout: 100ms
             BatchSize:
