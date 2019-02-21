@@ -120,7 +120,7 @@ async function populate(config, channel) {
 
     const tx_id = client.newTransactionID();
 
-    p = new Promise(resolve => eventhub.registerTxEvent(tx_id.getTransactionID(),
+    const p = new Promise(resolve => eventhub.registerTxEvent(tx_id.getTransactionID(),
         (txId, code, block_bumber) => resolve(txId),
         err => console.error('EventHub error ', err),
         { unregister: true }));
