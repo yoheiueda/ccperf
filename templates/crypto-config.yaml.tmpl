@@ -25,7 +25,7 @@ PeerOrgs:
           {% if peer.host != "localhost" -%}
           - "{{ peer.host }}"
           {%- endif %}
+    {% endfor %}
     Users:
       Count: 1
-    {% endfor %}
 {%- endfor -%}
