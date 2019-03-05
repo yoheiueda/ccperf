@@ -422,7 +422,7 @@ async function master(config) {
     const blockTable = {};
 
     let blocksLog;
-    if (config.committingPeer || config.grafana) {
+    if (config.committingPeerName || config.grafana) {
         if (config.committingPeer && config.logdir) {
             const blocksLogPath = config.logdir + '/blocks.json';
             blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
