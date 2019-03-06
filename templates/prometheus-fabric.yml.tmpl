@@ -1,0 +1,20 @@
+- targets:
+  {%- for org in orgs %}
+  {%- for peer in org.peers %}
+    - {{ peer.name}}.{{ org.domain }}:8080
+  {%- endfor %}
+  {%- endfor %}
+  labels:
+    service: peer
+
+- targets:
+  {%- for orderer in ordererorg.orderers %}
+    - {{ orderer.name}}.{{ ordererorg.domain }}:8080
+  {%- endfor %}
+  labels:
+    service: orderer
+
+- targets:
+    - cadvisor:8080
+    - node-exporter:9100
+    - pushgateway:9091

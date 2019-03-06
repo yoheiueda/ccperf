@@ -153,11 +153,11 @@ async function monitor(config, channel, blockTable, blocksLog) {
         const description = util.format("Target:%d Processes:%d Duration:%d Type:%s Num:%d Size:%d", 1000 / config.interval * config.processes, config.processes, config.duration, config.type, config.num, config.size);
 
         const payload = {
-            "dashboardId": 2,
+            //"dashboardId": 2,
             "time": config.start,
             "isRegion": true,
             "timeEnd": config.start + config.duration,
-            "tags": [],
+            "tags": ["run"],
             "text": description
         }
 

@@ -1,0 +1,16 @@
+- targets:
+    - peer1.org1.example.com:8080
+    - peer2.org1.example.com:8080
+    - peer3.org1.example.com:8080
+  labels:
+    service: peer
+
+- targets:
+    - orderer1.example.com:8080
+  labels:
+    service: orderer
+
+- targets:
+    - cadvisor:8080
+    - node-exporter:9100
+    - pushgateway:9091

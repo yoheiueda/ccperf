@@ -7,6 +7,8 @@ services:
   {%- for orderer in ordererorg.orderers %}
   {{ orderer.name }}:
     container_name: {{ orderer.name }}
+    labels:
+      ccperf.container.type: sut
     image: hyperledger/fabric-orderer:${FABRIC_TAG}
     environment:
       #- ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
@@ -61,6 +63,8 @@ services:
   {{ org.name }}-{{ peer.name }}:
     container_name: {{ org.name }}-{{ peer.name }}
     image: hyperledger/fabric-peer:${FABRIC_TAG}
+    labels:
+      ccperf.container.type: sut
     environment:
       - FABRIC_LOGGING_SPEC=${FABRIC_LOGGING_SPEC}
       - CORE_OPERATIONS_LISTENADDRESS=0.0.0.0:8080

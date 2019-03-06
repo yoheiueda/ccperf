@@ -8,15 +8,18 @@
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
         "name": "Annotations & Alerts",
-        "type": "dashboard"
+        "tags": [
+          "run"
+        ],
+        "type": "tags"
       }
     ]
   },
   "editable": true,
   "gnetId": null,
   "graphTooltip": 0,
-  "id": 1,
-  "iteration": 1548744914034,
+  "id": 2,
+  "iteration": 1551862370158,
   "links": [
     {
       "icon": "external link",
@@ -398,14 +401,14 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 4
+        "y": 20
       },
       "id": 39,
       "panels": [],
       "repeat": "channel",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -424,7 +427,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 5
+        "y": 21
       },
       "id": 2,
       "legend": {
@@ -446,7 +449,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -457,7 +460,7 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(ledger_transaction_count{channel=\"$channel\",chaincode!=\"unknown\"}[$span])",
+          "expr": "irate(ledger_transaction_count{channel=\"$channel\",instance=~\"$peer:.*\",chaincode!=\"unknown\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "{{chaincode}} ({{ validation_code }})",
@@ -468,7 +471,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Transcations per second",
+      "title": "Transcations per second [$peer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -515,7 +518,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 5
+        "y": 21
       },
       "id": 112,
       "legend": {
@@ -537,7 +540,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -548,10 +551,10 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(ledger_blockchain_height{channel=~\"$channel\"}[$span])",
+          "expr": "irate(ledger_blockchain_height{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "blocks ({{ instance }})",
+          "legendFormat": "blocks",
           "refId": "A"
         }
       ],
@@ -559,7 +562,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Blocks per second",
+      "title": "Blocks per second [$peer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -601,12 +604,210 @@
       "bars": false,
       "dashLength": 10,
       "dashes": false,
+      "datasource": "Prometheus",
       "fill": 1,
       "gridPos": {
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 14
+        "y": 30
+      },
+      "id": 127,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": true,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "irate(endorser_proposals_received{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "Received",
+          "refId": "A"
+        },
+        {
+          "expr": "irate(endorser_successful_proposals{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "Succeeded",
+          "refId": "B"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Endorser proposals ($peer)",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": "Proposals per second",
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 30
+      },
+      "id": 129,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": true,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "irate(endorser_propsal_duration_sum{instance=~\"$peer:.*\",channel=~\"$channel\"}[$span])/irate(endorser_propsal_duration_count{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "{{ chaincode }}",
+          "refId": "A"
+        },
+        {
+          "expr": "irate(endorser_propsal_duration_sum{instance=~\"$peer:.*\",channel=\"\"}[$span])/irate(endorser_propsal_duration_count{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "{{ chaincode }}",
+          "refId": "B"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Endorser proposal latencies ($peer)",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "s",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 39
       },
       "id": 115,
       "legend": {
@@ -628,7 +829,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -639,25 +840,41 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(chaincode_shim_requests_received{channel=~\"$channel\"}[$span])",
+          "expr": "irate(chaincode_shim_requests_received{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{ type }} recieved ({{ instance }})",
+          "legendFormat": "{{ type }} recieved ({{ chaincode }})",
           "refId": "A"
         },
         {
-          "expr": "irate(chaincode_shim_requests_completed{channel=~\"$channel\"}[$span])",
+          "expr": "irate(chaincode_shim_requests_received{channel=\"\",instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "hide": false,
+          "intervalFactor": 1,
+          "legendFormat": "{{ type }} recieved ({{ chaincode }})",
+          "refId": "B"
+        },
+        {
+          "expr": "irate(chaincode_shim_requests_completed{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{ type }} completed ({{ instance }})",
-          "refId": "B"
+          "legendFormat": "{{ type }} completed ({{ chaincode }})",
+          "refId": "C"
+        },
+        {
+          "expr": "irate(chaincode_shim_requests_completed{channel=\"\",instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "hide": false,
+          "intervalFactor": 1,
+          "legendFormat": "{{ type }} completed ({{ chaincode }})",
+          "refId": "D"
         }
       ],
       "thresholds": [],
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Chaincode shim operations",
+      "title": "Chaincode shim operations [$peer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -704,7 +921,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 14
+        "y": 39
       },
       "id": 119,
       "legend": {
@@ -726,7 +943,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -737,18 +954,25 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(chaincode_shim_request_duration_sum{channel=~\"$channel\"}[$span])/irate(chaincode_shim_request_duration_count{channel=~\"$channel\"}[$span])",
+          "expr": "irate(chaincode_shim_request_duration_sum{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])/irate(chaincode_shim_request_duration_count{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{ type }}/{{ success }} ({{ chaincode }} {{ instance }})",
+          "legendFormat": "{{ type }}/{{ success }} ({{ chaincode }})",
           "refId": "A"
+        },
+        {
+          "expr": "irate(chaincode_shim_request_duration_sum{channel=\"\",instance=~\"$peer:.*\"}[$span])/irate(chaincode_shim_request_duration_count{channel=\"\",instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "{{ type }}/{{ success }} ({{ chaincode }})",
+          "refId": "B"
         }
       ],
       "thresholds": [],
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Chaincode shim latencies",
+      "title": "Chaincode shim latencies [$peer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -764,7 +988,7 @@
       },
       "yaxes": [
         {
-          "format": "short",
+          "format": "s",
           "label": null,
           "logBase": 1,
           "max": null,
@@ -790,12 +1014,13 @@
       "bars": false,
       "dashLength": 10,
       "dashes": false,
+      "datasource": "Prometheus",
       "fill": 1,
       "gridPos": {
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 23
+        "y": 48
       },
       "id": 110,
       "legend": {
@@ -817,7 +1042,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -828,10 +1053,10 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "sum(irate(broadcast_processed_count{channel=~\"$channel\"}[$span])) by (instance)",
+          "expr": "sum(irate(broadcast_processed_count{channel=~\"$channel\",instance=~\"$orderer:.*\"}[$span])) by (instance)",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "{{ instance }}",
+          "legendFormat": "transaction",
           "refId": "A"
         }
       ],
@@ -839,7 +1064,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Orderer Transaction Throughputs",
+      "title": "Orderer Transaction Throughputs [$orderer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -856,7 +1081,7 @@
       "yaxes": [
         {
           "format": "short",
-          "label": null,
+          "label": "Transactions per second",
           "logBase": 1,
           "max": null,
           "min": "0",
@@ -886,7 +1111,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 23
+        "y": 48
       },
       "id": 106,
       "legend": {
@@ -908,7 +1133,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -919,14 +1144,14 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "sum(irate(broadcast_validate_duration_sum{channel=~\"$channel\",type=\"ENDORSER_TRANSACTION\"}[$span]))/sum(irate(broadcast_validate_duration_count{channel=~\"$channel\",type=\"ENDORSER_TRANSACTION\"}[$span]))",
+          "expr": "sum(irate(broadcast_validate_duration_sum{channel=~\"$channel\",instance=~\"$orderer:.*\",type=\"ENDORSER_TRANSACTION\"}[$span]))/sum(irate(broadcast_validate_duration_count{channel=~\"$channel\",type=\"ENDORSER_TRANSACTION\"}[$span]))",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "validate",
           "refId": "A"
         },
         {
-          "expr": "sum(irate(broadcast_enqueue_duration_sum{channel=~\"$channel\",type=\"ENDORSER_TRANSACTION\"}[$span]))/sum(irate(broadcast_enqueue_duration_count{channel=~\"$channel\",type=\"ENDORSER_TRANSACTION\"}[$span]))",
+          "expr": "sum(irate(broadcast_enqueue_duration_sum{channel=~\"$channel\",instance=~\"$orderer:.*\",type=\"ENDORSER_TRANSACTION\"}[$span]))/sum(irate(broadcast_enqueue_duration_count{channel=~\"$channel\",type=\"ENDORSER_TRANSACTION\"}[$span]))",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "enqueue",
@@ -937,7 +1162,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Orderer Transaction Latencies (stacked)",
+      "title": "Orderer Transaction Latencies (stacked) [$orderer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -985,7 +1210,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 32
+        "y": 57
       },
       "id": 96,
       "legend": {
@@ -1007,7 +1232,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -1018,7 +1243,7 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "idelta(blockcutter_block_fill_duration_sum{channel=~\"$channel\"}[$span])/idelta(blockcutter_block_fill_duration_count{channel=~\"$channel\"}[$span])",
+          "expr": "idelta(blockcutter_block_fill_duration_sum{channel=~\"$channel\",instance=~\"$orderer:.*\"}[$span])/idelta(blockcutter_block_fill_duration_count{channel=~\"$channel\",instance=~\"$orderer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "block_fill",
@@ -1029,7 +1254,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Orderer Block Latencies",
+      "title": "Orderer Block Latencies [$orderer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -1076,7 +1301,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 32
+        "y": 57
       },
       "id": 108,
       "legend": {
@@ -1098,7 +1323,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -1109,38 +1334,38 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(deliver_blocks_sent{channel=~\"$channel\",instance=~\"orderer.*\"}[$span])",
+          "expr": "irate(deliver_blocks_sent{channel=~\"$channel\",instance=~\"$orderer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "blocks_sent ({{ instance }}, filtered:{{ filtered }})",
+          "legendFormat": "blocks_sent (filtered:{{ filtered }})",
           "refId": "A"
         },
         {
-          "expr": "irate(deliver_requests_received{channel=~\"$channel\",instance=~\"orderer.*\"}[$span])",
+          "expr": "irate(deliver_requests_received{channel=~\"$channel\",instance=~\"$orderer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "requests_received  ({{ instance }}, filtered:{{ filtered }})",
+          "legendFormat": "requests_received  (filtered:{{ filtered }})",
           "refId": "B"
         },
         {
-          "expr": "irate(deliver_requests_completed{channel=~\"$channel\",instance=~\"orderer.*\"}[$span])",
+          "expr": "irate(deliver_requests_completed{channel=~\"$channel\",instance=~\"$orderer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "requests_completed  ({{ instance }}, filtered:{{ filtered }})",
+          "legendFormat": "requests_completed  (filtered:{{ filtered }})",
           "refId": "C"
         },
         {
-          "expr": "irate(deliver_streams_opened{instance=~\"orderer.*\"}[$span])",
+          "expr": "irate(deliver_streams_opened{instance=~\"$orderer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "streams_opened  ({{ instance }})",
+          "legendFormat": "streams_opened",
           "refId": "D"
         },
         {
-          "expr": "irate(deliver_streams_closed{instance=~\"orderer.*\"}[$span])",
+          "expr": "irate(deliver_streams_closed{instance=~\"$orderer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "streams_closed  ({{ instance }})",
+          "legendFormat": "streams_closed",
           "refId": "E"
         }
       ],
@@ -1148,7 +1373,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Orderer Deliver Blocks",
+      "title": "Orderer Deliver Blocks [$orderer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -1165,7 +1390,7 @@
       "yaxes": [
         {
           "format": "short",
-          "label": null,
+          "label": "Blocks per second",
           "logBase": 1,
           "max": null,
           "min": "0",
@@ -1196,7 +1421,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 41
+        "y": 66
       },
       "id": 4,
       "legend": {
@@ -1218,7 +1443,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -1229,21 +1454,21 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "idelta(ledger_block_processing_time_sum{channel=~\"$channel\"}[$span])/idelta(ledger_block_processing_time_count{channel=~\"$channel\"}[$span])",
+          "expr": "idelta(ledger_block_processing_time_sum{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])/idelta(ledger_block_processing_time_count{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "state_validation",
           "refId": "A"
         },
         {
-          "expr": "idelta(ledger_blockstorage_commit_time_sum{channel=~\"$channel\"}[$span])/idelta(ledger_blockstorage_commit_time_count{channel=~\"$channel\"}[$span])",
+          "expr": "idelta(ledger_blockstorage_commit_time_sum{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])/idelta(ledger_blockstorage_commit_time_count{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "block_commit",
           "refId": "B"
         },
         {
-          "expr": "idelta(ledger_statedb_commit_time_sum{channel=~\"$channel\"}[$span])/idelta(ledger_statedb_commit_time_count{channel=~\"$channel\"}[$span])",
+          "expr": "idelta(ledger_statedb_commit_time_sum{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])/idelta(ledger_statedb_commit_time_count{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "state_commit",
@@ -1254,7 +1479,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "Peer Latencies (stacked)",
+      "title": "Peer Latencies (stacked) [$peer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -1301,7 +1526,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 41
+        "y": 66
       },
       "id": 113,
       "legend": {
@@ -1323,7 +1548,7 @@
       "renderer": "flot",
       "scopedVars": {
         "channel": {
-          "selected": false,
+          "selected": true,
           "text": "mychannel",
           "value": "mychannel"
         }
@@ -1334,38 +1559,38 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "irate(deliver_blocks_sent{channel=~\"$channel\",instance=~\"peer.*\"}[$span])",
+          "expr": "irate(deliver_blocks_sent{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "blocks_sent ({{ instance }}, filtered:{{ filtered }})",
+          "legendFormat": "blocks_sent (filtered:{{ filtered }})",
           "refId": "A"
         },
         {
-          "expr": "irate(deliver_requests_received{channel=~\"$channel\",instance=~\"peer.*\"}[$span])",
+          "expr": "irate(deliver_requests_received{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "requests_received  ({{ instance }}, filtered:{{ filtered }})",
+          "legendFormat": "requests_received  (filtered:{{ filtered }})",
           "refId": "B"
         },
         {
-          "expr": "irate(deliver_requests_completed{channel=~\"$channel\",instance=~\"peer.*\"}[$span])",
+          "expr": "irate(deliver_requests_completed{channel=~\"$channel\",instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "requests_completed  ({{ instance }}, filtered:{{ filtered }})",
+          "legendFormat": "requests_completed  (filtered:{{ filtered }})",
           "refId": "C"
         },
         {
-          "expr": "irate(deliver_streams_opened{instance=~\"peer.*\"}[$span])",
+          "expr": "irate(deliver_streams_opened{instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "streams_opened  ({{ instance }})",
+          "legendFormat": "streams_opened",
           "refId": "D"
         },
         {
-          "expr": "irate(deliver_streams_closed{instance=~\"peer.*\"}[$span])",
+          "expr": "irate(deliver_streams_closed{instance=~\"$peer:.*\"}[$span])",
           "format": "time_series",
           "intervalFactor": 1,
-          "legendFormat": "streams_closed  ({{ instance }})",
+          "legendFormat": "streams_closed",
           "refId": "E"
         }
       ],
@@ -1373,7 +1598,7 @@
       "timeFrom": null,
       "timeRegions": [],
       "timeShift": null,
-      "title": "EventHub",
+      "title": "EventHub [$peer]",
       "tooltip": {
         "shared": true,
         "sort": 0,
@@ -1389,8 +1614,9 @@
       },
       "yaxes": [
         {
+          "decimals": null,
           "format": "short",
-          "label": null,
+          "label": "Operations per second",
           "logBase": 1,
           "max": null,
           "min": "0",
@@ -1411,12 +1637,296 @@
       }
     },
     {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 75
+      },
+      "id": 121,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": true,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "irate(gossip_comm_messages_received{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "received",
+          "refId": "A"
+        },
+        {
+          "expr": "irate(gossip_comm_messages_sent{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "sent",
+          "refId": "B"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Gossip messages ($peer)",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "short",
+          "label": "Messages per second",
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 75
+      },
+      "id": 123,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": true,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "irate(gossip_state_commit_duration_sum{instance=~\"$peer:.*\"}[$span])/irate(gossip_state_commit_duration_count{instance=~\"$peer:.*\"}[$span])",
+          "format": "time_series",
+          "interval": "",
+          "intervalFactor": 1,
+          "legendFormat": "block commit",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Gossip state commit latencies ($peer)",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "s",
+          "label": "",
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "datasource": "Prometheus",
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 84
+      },
+      "id": 125,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "scopedVars": {
+        "channel": {
+          "selected": true,
+          "text": "mychannel",
+          "value": "mychannel"
+        }
+      },
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "gossip_payload_buffer_size{instance=~\"$peer:.*\"}",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "payload buffer",
+          "refId": "A"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Gossip payload buffer size ($peer)",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "decbytes",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 441
       },
       "id": 85,
       "panels": [],
@@ -1433,7 +1943,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 51
+        "y": 442
       },
       "id": 87,
       "legend": {
@@ -1459,11 +1969,18 @@
       "steppedLine": false,
       "targets": [
         {
-          "expr": "sum (irate(container_cpu_usage_seconds_total{container_label_org_hyperledger_fabric_version!=\"\"}[$span])) by (name)",
+          "expr": "sum (irate(container_cpu_usage_seconds_total{container_label_ccperf_container_type=\"sut\"}[$span])) by (name)",
           "format": "time_series",
           "intervalFactor": 1,
           "legendFormat": "{{ name }}",
           "refId": "A"
+        },
+        {
+          "expr": "sum (irate(container_cpu_usage_seconds_total{container_label_org_hyperledger_fabric_chaincode_id_version!=\"\"}[$span])) by (name)",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "{{ name }}",
+          "refId": "B"
         }
       ],
       "thresholds": [],
@@ -1518,17 +2035,15 @@
       {
         "allValue": null,
         "current": {
-          "text": "All",
-          "value": [
-            "$__all"
-          ]
+          "text": "mychannel",
+          "value": "mychannel"
         },
         "datasource": "Prometheus",
         "definition": "ledger_transaction_count",
         "hide": 0,
-        "includeAll": true,
+        "includeAll": false,
         "label": "Channel",
-        "multi": true,
+        "multi": false,
         "name": "channel",
         "options": [],
         "query": "ledger_transaction_count",
@@ -1545,10 +2060,64 @@
       {
         "allValue": null,
         "current": {
+          "text": "orderer1.example.com",
+          "value": "orderer1.example.com"
+        },
+        "datasource": "Prometheus",
+        "definition": "blockcutter_block_fill_duration_count",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Orderer",
+        "multi": false,
+        "name": "orderer",
+        "options": [
+          {
+            "selected": true,
+            "text": "orderer1.example.com",
+            "value": "orderer1.example.com"
+          }
+        ],
+        "query": "blockcutter_block_fill_duration_count",
+        "refresh": 0,
+        "regex": "/.*instance=\"([^\"]*):.*/",
+        "skipUrlSync": false,
+        "sort": 0,
+        "tagValuesQuery": "",
+        "tags": [],
+        "tagsQuery": "",
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "allValue": null,
+        "current": {
+          "text": "peer3.org1.example.com",
+          "value": "peer3.org1.example.com"
+        },
+        "datasource": "Prometheus",
+        "definition": "ledger_transaction_count",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Peer",
+        "multi": false,
+        "name": "peer",
+        "options": [],
+        "query": "ledger_transaction_count",
+        "refresh": 2,
+        "regex": "/.*instance=\"([^\"]*):.*/",
+        "skipUrlSync": false,
+        "sort": 1,
+        "tagValuesQuery": "",
+        "tags": [],
+        "tagsQuery": "",
+        "type": "query",
+        "useTags": false
+      },
+      {
+        "allValue": null,
+        "current": {
           "text": "All",
-          "value": [
-            "$__all"
-          ]
+          "value": "$__all"
         },
         "datasource": "Prometheus",
         "definition": "container_cpu_usage_seconds_total{container_label_org_hyperledger_fabric_version!=\"\"}",
@@ -1593,9 +2162,7 @@
         "allValue": null,
         "current": {
           "text": "localhost",
-          "value": [
-            "localhost"
-          ]
+          "value": "localhost"
         },
         "datasource": "Prometheus",
         "definition": "label_values(node_uname_info{instance=~\"$node\"},nodename)",

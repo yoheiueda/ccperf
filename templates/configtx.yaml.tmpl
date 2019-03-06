@@ -87,6 +87,8 @@ Profiles:
                 {%- endfor %}
     MyChannel:
         Consortium: MyConsortium
+        Policies:
+            <<: *DefaultPolicies
         Application:
             Policies:
                 <<: *DefaultPolicies

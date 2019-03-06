@@ -18,3 +18,4 @@ for mspid in $mspids; do
   ./bin/configtxgen -profile MyChannel -outputAnchorPeersUpdate ${mspid}anchors.tx -channelID mychannel -asOrg ${mspid}
 done
 
+./applytmpl.py templates/prometheus-fabric.yml.tmpl  > ./prometheus/prometheus-fabric.yml
