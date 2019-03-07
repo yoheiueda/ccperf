@@ -101,7 +101,7 @@ function average(list) {
 function doRequest(options) {
     return new Promise(function (resolve, reject) {
         request(options, function (error, res, body) {
-            if (!error && res.statusCode == 200) {
+            if (!error && res.statusCode < 300) {
                 resolve(body);
             } else {
                 reject(error);
@@ -148,21 +148,57 @@ async function populate(config, channel) {
     eventhub.disconnect();
 }
 
-async function monitor(config, channel, blockTable, blocksLog) {
+async function monitor(config, channel, blockTable, blocksLog, txTable, metrics, prometheusConfig) {
+    if (config.prometheus) {
+        const timestamp = parseInt((config.start + config.rampup) / 1000);
+        const url = config.prometheus + '/metrics/job/fabric/run_timestamp/' + timestamp + '/duration_seconds/' + config.duration / 1000;
+
+        const requestOptions = {
+            url: url,
+            method: "PUT",
+            headers: {
+                "Content-type": "text/plain",
+            },
+            body: "ccperf_last_run_timestamp " + timestamp + "\n"
+        }
+        const res = await doRequest(requestOptions).catch(err => { throw new Error(err) });
+
+        prometheusConfig.intId = setInterval(() => {
+            const body =
+                "ccperf_endorsement_count " + metrics.endorsementCount + "\n" +
+                "ccperf_endorsement_sum " + metrics.endorsementSum / 1000 + "\n" +
+                "ccperf_sendtransaction_count " + metrics.endorsementCount + "\n" +
+                "ccperf_sendtransaction_sum " + metrics.endorsementSum / 1000 + "\n" +
+                "ccperf_commit_count_accurate " + metrics.commitCountAccurate + "\n" +
+                "ccperf_commit_count " + metrics.commitCount + "\n" +
+                "ccperf_commit_sum " + metrics.commitSum / 1000 + "\n";
+            //console.log(body);
+            const requestOptions = {
+                url: url,
+                method: "PUT",
+                headers: {
+                    "Content-type": "text/plain",
+                },
+                body: body
+            }
+            //console.log(requestOptions);
+            const p = doRequest(requestOptions).catch(err => { throw new Error(err) });
+
+        }, 1000);
+    }
     if (config.grafana) {
         const description = util.format("Target:%d Processes:%d Duration:%d Type:%s Num:%d Size:%d", 1000 / config.interval * config.processes, config.processes, config.duration, config.type, config.num, config.size);
 
         const payload = {
-            //"dashboardId": 2,
-            "time": config.start,
+            "time": config.start + config.rampup,
             "isRegion": true,
-            "timeEnd": config.start + config.duration,
+            "timeEnd": config.start + config.rampup + config.duration,
             "tags": ["run"],
             "text": description
         }
 
         const requestOptions = {
-            url: config.grafana,
+            url: config.grafana + '/api/annotations',
             method: "POST",
             headers: {
                 "Content-type": "application/json",
@@ -218,6 +254,15 @@ async function monitor(config, channel, blockTable, blocksLog) {
                         txTypes[tx.tx_validation_code] = txResults;
                     }
                     txResults.push(tx.txid);
+
+                    metrics.commitCountAccurate += 1;
+
+                    if (txTable[tx.txid] !== undefined) {
+                        metrics.commitCount += 1;
+                        metrics.commitSum += now - txTable[tx.txid][2];
+                    } else {
+                        metrics.pendings.set(tx.txid, now);
+                    }
                 }
                 blockTable[block.number] = { txset: txset, timestamp: now };
                 const count = block.filtered_transactions.length;
@@ -242,12 +287,15 @@ async function monitor(config, channel, blockTable, blocksLog) {
     }
 }
 
-async function unmonitor(config, channel, blocksLog) {
+async function unmonitor(config, channel, blocksLog, prometheusConfig) {
     const eventhub = channel.getChannelEventHub(config.committingPeerName);
     eventhub.unregisterBlockEvent(config.blockRegNum);
     eventhub.disconnect();
     if (config.logdir) {
         blocksLog.write('\n]\n');
+    }
+    if (prometheusConfig.intId !== undefined) {
+        clearInterval(prometheusConfig.intId);
     }
 }
 
@@ -339,7 +387,7 @@ async function printMetrics(blockTable, txTable) {
     }
 }
 
-async function invokeLocalWorkers(config, txTable, ws) {
+async function invokeLocalWorkers(config, txTable, metrics, ws) {
     const promises = [];
 
     const numProcesses = config.processes / config.remotes.length;
@@ -351,18 +399,31 @@ async function invokeLocalWorkers(config, txTable, ws) {
             w.send({ config: config });
         });
         if (txTable) {
-            w.on('message', (txStats) => {
-                for (const txid in txStats) {
-                    txTable[txid] = txStats[txid];
+            w.on('message', (msg) => {
+                if (msg.txStats) {
+                    const txStats = msg.txStats;
+                    for (const txid in txStats) {
+                        txTable[txid] = txStats[txid];
+                        const t4 = metrics.pendings.get(txid);
+                        if (t4 !== undefined) {
+                            metrics.pendings.delete(txid);
+                            metrics.commitCount += 1;
+                            metrics.commitSum += t4 - txStats[txid][2];
+                        }
+                    }
+                }
+                if (msg.metrics) {
+                    metrics.endorsementCount += msg.metrics.endorsementCount;
+                    metrics.endorsementSum += msg.metrics.endorsementSum;
+                    metrics.sendTransactionCount += msg.metrics.sendTransactionCount;
+                    metrics.sendTransactionSum += msg.metrics.sendTransactionSum;
                 }
             });
         } else {
-            w.on('message', (txStats) => {
-                const message = {
-                    txStats: txStats
-                }
+            w.on('message', (msg) => {
+                //TODO: Aggregate txStats and metrics here, and periodically send them to master
                 try {
-                    ws.send(JSON.stringify(message));
+                    ws.send(JSON.stringify(msg));
                 } catch (err) {
                     console.error(err);
                 }
@@ -387,7 +448,7 @@ async function invokeLocalWorkers(config, txTable, ws) {
     return Promise.all(promises);
 }
 
-async function invokeRemoteWorkers(config, remote, txTable) {
+async function invokeRemoteWorkers(config, remote, txTable, metrics) {
     const hostport = remote.split(':');
     const host = hostport[0];
     const port = Number(hostport[1]);
@@ -397,9 +458,17 @@ async function invokeRemoteWorkers(config, remote, txTable) {
 
     ws.on('message', message => {
         const json = JSON.parse(message);
-        const txStats = json.txStats;
-        for (const txid in txStats) {
-            txTable[txid] = txStats[txid];
+        if (json.txStats) {
+            const txStats = json.txStats;
+            for (const txid in txStats) {
+                txTable[txid] = txStats[txid];
+            }
+        }
+        if (json.metrics) {
+            metrics.endorsementCount += json.metrics.endorsementCount;
+            metrics.endorsementSum += json.metrics.endorsementSum;
+            metrics.sendTransactionCount += json.metrics.sendTransactionCount;
+            metrics.sendTransactionSum += json.metrics.sendTransactionSum;
         }
     });
 
@@ -421,24 +490,35 @@ async function master(config) {
     config.start = Date.now() + 5000;
     const blockTable = {};
 
+    const txTable = {};
+    const metrics = {
+        endorsementCount: 0,
+        endorsementSum: 0,
+        sendTransactionCount: 0,
+        sendTransactionSum: 0,
+        commitCountAccurate: 0,
+        commitCount: 0,
+        commitSum: 0,
+        pendings: new Map()
+    };
+    const prometheusConfig = {};
+
     let blocksLog;
-    if (config.committingPeerName || config.grafana) {
+    if (config.committingPeerName || config.grafana || config.prometheus) {
         if (config.committingPeer && config.logdir) {
             const blocksLogPath = config.logdir + '/blocks.json';
             blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
         }
-        await monitor(config, channel, blockTable, blocksLog);
+        await monitor(config, channel, blockTable, blocksLog, txTable, metrics, prometheusConfig);
     }
-
-    const txTable = {};
 
     const promises = [];
     for (const remote of config.remotes) {
         let promise;
         if (remote === "local") {
-            promise = invokeLocalWorkers(config, txTable);
+            promise = invokeLocalWorkers(config, txTable, metrics);
         } else {
-            promise = invokeRemoteWorkers(config, remote, txTable);
+            promise = invokeRemoteWorkers(config, remote, txTable, metrics);
         }
         promises.push(promise);
     }
@@ -452,12 +532,15 @@ async function master(config) {
     // block = await channel.queryBlock(height-1);
 
     if (config.committingPeerName) {
-        await unmonitor(config, channel, blocksLog);
+        await unmonitor(config, channel, blocksLog, prometheusConfig);
     }
     if (blocksLog) {
         blocksLog.close();
     }
 
+
+    console.log('Start: ', config.start + config.rampup);
+    console.log('End: ', config.start + config.rampup + config.duration);
     await printMetrics(blockTable, txTable);
 }
 
@@ -500,6 +583,11 @@ async function execute(context) {
 
     const t2 = new Date();
 
+    if (context.metrics) {
+        context.metrics.endorsementCount += 1;
+        context.metrics.endorsementSum += t2 - t1;
+    }
+
     const proposalResponses = results[0];
 
     if (proposalResponses.length == 0) {
@@ -528,6 +616,11 @@ async function execute(context) {
 
     const t3 = new Date();
 
+    if (context.metrics) {
+        context.metrics.sendTransactionCount += 1;
+        context.metrics.sendTransactionSum += t3 - t2;
+    }
+
     txStats[tx_id.getTransactionID()] = [t1.getTime(), t2.getTime(), t3.getTime()];
     if (context.requestsLog) {
         if (context.index > 0) {
@@ -537,6 +630,13 @@ async function execute(context) {
     }
 
     context.index += 1;
+}
+
+function reportPrometheusMetrics(context) {
+    const txStats = context.txStats;
+    context.txStats = {};
+    //console.log(context.metrics);
+    process.send({ metrics: context.metrics, txStats: txStats });
 }
 
 async function worker(config) {
@@ -587,6 +687,25 @@ async function worker(config) {
         context.genTransientMap = genTransientMap;
     }
 
+    let intId;
+    if (config.prometheus) {
+        context.metrics = {
+            endorsementCount: 0,
+            endorsementSum: 0,
+            sendTransactionCount: 0,
+            sendTransactionSum: 0
+        };
+        intId = setInterval(() => {
+            reportPrometheusMetrics(context);
+            context.metrics = {
+                endorsementCount: 0,
+                endorsementSum: 0,
+                sendTransactionCount: 0,
+                sendTransactionSum: 0
+            };
+        }, 1000);
+    }
+
     const wait = config.start + config.delay - Date.now();
     if (wait > 0) {
         await sleep(wait);
@@ -596,7 +715,7 @@ async function worker(config) {
     //await sleep(duration);
     //clearInterval(timeout);
 
-    const end = Date.now() + config.duration;
+    const end = config.start + config.rampup + config.duration + config.rampdown;
     let behind = 0;
     while (true) {
         const before = Date.now();
@@ -616,8 +735,13 @@ async function worker(config) {
 
     //console.log(info.index/duration*1000);
 
+    if (config.prometheus) {
+        clearInterval(intId);
+        reportPrometheusMetrics(context);
+    }
+
     await new Promise(resolve => {
-        process.send(txStats, null, {}, resolve);
+        process.send({ txStats: txStats }, null, {}, resolve);
     });
 
     if (config.logdir) {
@@ -731,9 +855,11 @@ function run(cmd) {
         size: cmd.size === undefined ? 1 : Number(cmd.size),
         population: cmd.population === undefined ? undefined : Number(cmd.population),
         grafana: cmd.grafana,
+        prometheus: cmd.prometheusPushgateway,
         duration: duration,
         interval: interval,
         rampup: rampup,
+        rampdown: 5,
         remotes: remotes
     };
 
@@ -761,7 +887,7 @@ function daemon(cmd) {
                 case 'start':
                     const config = json.config;
                     console.log('Start %d workers', json.config.processes);
-                    invokeLocalWorkers(config, null, ws).then(() => { ws.close() });
+                    invokeLocalWorkers(config, null, null, ws).then(() => { ws.close() });
                     break;
             }
         });
@@ -813,6 +939,7 @@ function main() {
         .option('--endorsing-orgs [org1,org2]', 'Comma-separated list of organizations')
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
         .option('--grafana [url]', "Grafana endpoint URL ")
+        .option('--prometheus-pushgateway [url]', "Prometheus endpoint URL ")
         .option('--remote [hostport]', "Remote worker daemons. Comma-separated list of host:port or local")
         .action(run);
 
