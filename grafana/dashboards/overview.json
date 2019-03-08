@@ -19,7 +19,7 @@
   "gnetId": null,
   "graphTooltip": 0,
   "id": 2,
-  "iteration": 1551862370158,
+  "iteration": 1551946596686,
   "links": [
     {
       "icon": "external link",
@@ -401,7 +401,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 20
+        "y": 4
       },
       "id": 39,
       "panels": [],
@@ -427,7 +427,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 21
+        "y": 5
       },
       "id": 2,
       "legend": {
@@ -518,7 +518,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 21
+        "y": 5
       },
       "id": 112,
       "legend": {
@@ -604,13 +604,210 @@
       "bars": false,
       "dashLength": 10,
       "dashes": false,
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 14
+      },
+      "id": 131,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": false,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "sum(irate(ccperf_endorsement_count[$span]))",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "endorsement",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(irate(ccperf_sendtransaction_count[$span]))",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "send_transaction",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(irate(ccperf_commit_count_accurate[$span]))",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "commit",
+          "refId": "C"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Client throughputs",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "decimals": null,
+          "format": "short",
+          "label": "Transactions per second",
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
+      "fill": 1,
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 14
+      },
+      "id": 133,
+      "legend": {
+        "avg": false,
+        "current": false,
+        "max": false,
+        "min": false,
+        "show": true,
+        "total": false,
+        "values": false
+      },
+      "lines": true,
+      "linewidth": 1,
+      "links": [],
+      "nullPointMode": "null",
+      "percentage": false,
+      "pointradius": 5,
+      "points": false,
+      "renderer": "flot",
+      "seriesOverrides": [],
+      "spaceLength": 10,
+      "stack": true,
+      "steppedLine": false,
+      "targets": [
+        {
+          "expr": "max(irate(ccperf_endorsement_sum[$span])/irate(ccperf_endorsement_count[$span]))",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "endorsement",
+          "refId": "A"
+        },
+        {
+          "expr": "max(irate(ccperf_sendtransaction_sum[$span])/irate(ccperf_sendtransaction_count[$span]))",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "send_transaction",
+          "refId": "B"
+        },
+        {
+          "expr": "max(irate(ccperf_commit_sum[$span])/irate(ccperf_commit_count[$span]))",
+          "format": "time_series",
+          "intervalFactor": 1,
+          "legendFormat": "commit",
+          "refId": "C"
+        }
+      ],
+      "thresholds": [],
+      "timeFrom": null,
+      "timeRegions": [],
+      "timeShift": null,
+      "title": "Client latencies (stacked)",
+      "tooltip": {
+        "shared": true,
+        "sort": 0,
+        "value_type": "individual"
+      },
+      "type": "graph",
+      "xaxis": {
+        "buckets": null,
+        "mode": "time",
+        "name": null,
+        "show": true,
+        "values": []
+      },
+      "yaxes": [
+        {
+          "format": "s",
+          "label": "",
+          "logBase": 1,
+          "max": null,
+          "min": "0",
+          "show": true
+        },
+        {
+          "format": "short",
+          "label": null,
+          "logBase": 1,
+          "max": null,
+          "min": null,
+          "show": true
+        }
+      ],
+      "yaxis": {
+        "align": false,
+        "alignLevel": null
+      }
+    },
+    {
+      "aliasColors": {},
+      "bars": false,
+      "dashLength": 10,
+      "dashes": false,
       "datasource": "Prometheus",
       "fill": 1,
       "gridPos": {
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 30
+        "y": 23
       },
       "id": 127,
       "legend": {
@@ -709,7 +906,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 30
+        "y": 23
       },
       "id": 129,
       "legend": {
@@ -807,7 +1004,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 39
+        "y": 32
       },
       "id": 115,
       "legend": {
@@ -921,7 +1118,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 39
+        "y": 32
       },
       "id": 119,
       "legend": {
@@ -1020,7 +1217,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 48
+        "y": 41
       },
       "id": 110,
       "legend": {
@@ -1111,7 +1308,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 48
+        "y": 41
       },
       "id": 106,
       "legend": {
@@ -1210,7 +1407,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 57
+        "y": 50
       },
       "id": 96,
       "legend": {
@@ -1301,7 +1498,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 57
+        "y": 50
       },
       "id": 108,
       "legend": {
@@ -1421,7 +1618,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 66
+        "y": 59
       },
       "id": 4,
       "legend": {
@@ -1526,7 +1723,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 66
+        "y": 59
       },
       "id": 113,
       "legend": {
@@ -1647,7 +1844,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 75
+        "y": 68
       },
       "id": 121,
       "legend": {
@@ -1746,7 +1943,7 @@
         "h": 9,
         "w": 12,
         "x": 12,
-        "y": 75
+        "y": 68
       },
       "id": 123,
       "legend": {
@@ -1839,7 +2036,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 84
+        "y": 77
       },
       "id": 125,
       "legend": {
@@ -1926,7 +2123,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 441
+        "y": 86
       },
       "id": 85,
       "panels": [],
@@ -1943,7 +2140,7 @@
         "h": 9,
         "w": 12,
         "x": 0,
-        "y": 442
+        "y": 87
       },
       "id": 87,
       "legend": {
@@ -2060,6 +2257,7 @@
       {
         "allValue": null,
         "current": {
+          "selected": true,
           "text": "orderer1.example.com",
           "value": "orderer1.example.com"
         },
@@ -2091,8 +2289,8 @@
       {
         "allValue": null,
         "current": {
-          "text": "peer3.org1.example.com",
-          "value": "peer3.org1.example.com"
+          "text": "peer1.org1.example.com",
+          "value": "peer1.org1.example.com"
         },
         "datasource": "Prometheus",
         "definition": "ledger_transaction_count",
@@ -2161,6 +2359,7 @@
       {
         "allValue": null,
         "current": {
+          "selected": true,
           "text": "localhost",
           "value": "localhost"
         },
@@ -2186,6 +2385,7 @@
       {
         "allValue": null,
         "current": {
+          "selected": true,
           "text": "node-exporter:9100",
           "value": "node-exporter:9100"
         },
@@ -2211,7 +2411,7 @@
     ]
   },
   "time": {
-    "from": "now-5m",
+    "from": "now-15m",
     "to": "now"
   },
   "timepicker": {
@@ -2242,5 +2442,5 @@
   "timezone": "",
   "title": "Overview",
   "uid": "fabric1",
-  "version": 1
+  "version": 3
 }
