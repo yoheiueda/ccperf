@@ -11,6 +11,7 @@ const sprintf = require('sprintf-js').sprintf;
 const yaml = require('js-yaml');
 const request = require('request');
 const WebSocket = require('ws');
+const glob = require('glob');
 
 const logger = require('winston');
 if (process.env.FABRIC_CONFIG_LOGLEVEL) {
@@ -544,17 +545,26 @@ async function master(config) {
     await printMetrics(blockTable, txTable);
 }
 
+function getAccount(max) {
+    const randomNum = 1 + Math.floor(Math.random() * max);
+    return sprintf('%034d', randomNum);
+}
+
 const handlerTable = {
     'putstate': {
+	'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
     },
     'getstate': {
+	'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
     },
     'mix': {
+	'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
     },
     'json': {
+	'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
     }
 }
@@ -562,13 +572,18 @@ const handlerTable = {
 async function execute(context) {
     const client = context.client;
     const channel = context.channel;
+    if (context.userClients) {
+        client = info.userClients[(context.workerID * 41 + context.index * 601) % context.userClients.length];
+        console.log('client=', client);
+        channel = client.getChannel();
+    }
     const txStats = context.txStats;
 
     const tx_id = client.newTransactionID();
 
     const request = {
         targets: context.peers,
-        chaincodeId: 'ccperf',
+        chaincodeId: context.chaincodeId,
         fcn: context.config.type,
         args: context.genArgs(context),
         txId: tx_id
@@ -643,6 +658,15 @@ async function worker(config) {
     const client = await getClient(config.profile, config.orgName);
     const channel = client.getChannel(config.channelID);
     const txStats = {};
+
+    if (config.txHandler) {
+        const txHandler = eval(config.txHandler);
+        const plugin = new txHandler();
+        const txName = plugin.getName();
+        handlerTable[txName] = plugin.getHandler();
+    }
+
+    const chaincodeId = handlerTable[config.type].chaincodeId;
     const genArgs = handlerTable[config.type].genArgs;
     const genTransientMap = handlerTable[config.type].genTransientMap;
 
@@ -669,6 +693,7 @@ async function worker(config) {
         config: config,
         client: client,
         channel: channel,
+	chaincodeId: chaincodeId,
         peers: peers,
         txStats: txStats,
         workerID: cluster.worker.id,
@@ -685,6 +710,32 @@ async function worker(config) {
 
     if (genTransientMap) {
         context.genTransientMap = genTransientMap;
+    }
+
+    if (config.clientKeys) {
+	const clientKeys = config.clientKeys;
+        const userClients = [];
+        const keys = glob.sync(clientKeys + '/*');
+        for (keyfile of keys) {
+            if (keyfile.endsWith('-pub') || keyfile.endsWith('-priv')) {
+                continue;
+            }
+            const json = JSON.parse(loadFile(keyfile));
+            const ski = json.enrollment.signingIdentity;
+            const userOpts = {
+                username: json.name,
+                mspid: json.mspid,
+                cryptoContent: {
+                    signedCertPEM: json.enrollment.identity.certificate,
+                    privateKeyPEM: loadFile(clientKeys + '/' + ski + '-priv')
+                },
+                skipPersistence: false
+            };
+            const userClient = await getClient(config.profile, config.orgName);
+            const user = await userClient.createUser(userOpts);
+            userClients.push(userClient);
+        }
+        info.userClients = userClients;
     }
 
     let intId;
@@ -839,6 +890,11 @@ function run(cmd) {
         remotes = cmd.remote.split(',');
     }
 
+    let txHandlerStr;
+    if (cmd.txHandler !== undefined) {
+        txHandlerStr = loadFile(cmd.TxHandler);
+    }
+
     const config = {
         profile: profile,
         channelID: cmd.channelID,
@@ -854,6 +910,8 @@ function run(cmd) {
         num: cmd.num === undefined ? 1 : Number(cmd.num),
         size: cmd.size === undefined ? 1 : Number(cmd.size),
         population: cmd.population === undefined ? undefined : Number(cmd.population),
+	txHandler: txHandlerStr,
+	clientKeys: cmd.clientKeys,
         grafana: cmd.grafana,
         prometheus: cmd.prometheusPushgateway,
         duration: duration,
@@ -935,12 +993,14 @@ function main() {
         .option('--num [number]', "Number of operations per transaction")
         .option('--size [bytes]', "Payload size of a PutState call")
         .option('--population [number]', "Number of prepopulated key-values")
+	.option('--tx-plugin', "JavaScript file that defines transaction handler")
         .option('--committing-peer [name]', "Peer name whose commit events are monitored ")
         .option('--endorsing-orgs [org1,org2]', 'Comma-separated list of organizations')
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
         .option('--grafana [url]', "Grafana endpoint URL ")
         .option('--prometheus-pushgateway [url]', "Prometheus endpoint URL ")
         .option('--remote [hostport]', "Remote worker daemons. Comma-separated list of host:port or local")
+	.option('--client-keys [dir]', 'Directory for client keys')
         .action(run);
 
     program.command('daemon')
