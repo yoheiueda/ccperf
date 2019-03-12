@@ -1,7 +1,7 @@
 - targets:
   {%- for org in orgs %}
   {%- for peer in org.peers %}
-    - {{ peer.name}}.{{ org.domain }}:8080
+    - {{ peer.name }}.{{ org.domain }}:{{ peer.ports.exporter }}
   {%- endfor %}
   {%- endfor %}
   labels:
@@ -9,12 +9,24 @@
 
 - targets:
   {%- for orderer in ordererorg.orderers %}
-    - {{ orderer.name}}.{{ ordererorg.domain }}:8080
+    - {{ orderer.name }}.{{ ordererorg.domain }}:{{ orderer.ports.exporter }}
   {%- endfor %}
   labels:
     service: orderer
 
 - targets:
-    - cadvisor:8080
-    - node-exporter:9100
+  {%- for cadvisor in cadvisors %}
+    - {{ cadvisor.host }}:{{ cadvisor.port }}
+  {%- endfor %}
+  labels:
+    service: cadvisor
+
+- targets:
+  {%- for node_exporter in node_exporters %}
+    - {{ node_exporter.host }}:{{ node_exporter.port }}
+  {%- endfor %}
+  labels:
+    service: node_exporter
+
+- targets:
     - pushgateway:9091

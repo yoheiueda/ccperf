@@ -13,11 +13,11 @@ services:
     environment:
       #- ORDERER_GENERAL_LOGLEVEL=${ORDERER_GENERAL_LOGLEVEL}
       - FABRIC_LOGGING_SPEC=${FABRIC_LOGGING_SPEC}
-      - ORDERER_OPERATIONS_LISTENADDRESS=0.0.0.0:8080
+      - ORDERER_OPERATIONS_LISTENADDRESS=0.0.0.0:{{ orderer.ports.exporter or "8080" }}
       - ORDERER_OPERATIONS_TLS_ENABLED=false
       - ORDERER_METRICS_PROVIDER=prometheus
       - ORDERER_GENERAL_LISTENADDRESS=0.0.0.0
-      - ORDERER_GENERAL_LISTENPORT=7050
+      - ORDERER_GENERAL_LISTENPORT={{ orderer.ports.requests }}
       - ORDERER_GENERAL_GENESISMETHOD=file
       - ORDERER_GENERAL_GENESISFILE=/var/hyperledger/orderer/orderer.genesis.block
       - ORDERER_GENERAL_LOCALMSPID={{ ordererorg.mspid }}
@@ -45,14 +45,24 @@ services:
       - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/msp:/var/hyperledger/orderer/msp
       - ./crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{orderer.name}}.{{ ordererorg.domain }}/tls/:/var/hyperledger/orderer/tls
     ports:
-      - {{ orderer.ports.requests}}:7050
-      - {{ orderer.ports.pprof}}:6060
+      - {{ orderer.ports.requests }}:{{ orderer.ports.requests }}
+      {%- if orderer.ports.exporter %}
+      - {{ orderer.ports.exporter }}:{{ orderer.ports.exporter }}
+      {%- endif %}
     networks:
       {{ network }}:
         aliases:
           - {{ orderer.name}}.{{ ordererorg.domain }}
+    {%- if ordererorg.orderers | selectattr('host', 'ne', orderer.host) | list | length is gt 0 %}
+    extra_hosts:
+    {%- for o in ordererorg.orderers %}
+    {%- if o.host != orderer.host %}
+      - {{ o.name}}.{{ ordererorg.domain }}:{{ o.host | getip }}
+    {%- endif %}
+    {%- endfor %}
+    {%- endif %}
     healthcheck:
-      test: wget -q -O- http://localhost:8080/healthz | grep -q '"status":"OK"'
+      test: wget -q -O- http://localhost:{{ orderer.ports.exporter or "8080" }}/healthz | grep -q '"status":"OK"'
       interval: 5s
       timeout: 5s
       retries: 0
@@ -62,27 +72,26 @@ services:
 
   {{ org.name }}-{{ peer.name }}:
     container_name: {{ org.name }}-{{ peer.name }}
-    image: hyperledger/fabric-peer:${FABRIC_TAG}
     labels:
       ccperf.container.type: sut
+    image: hyperledger/fabric-peer:${FABRIC_TAG}
     environment:
       - FABRIC_LOGGING_SPEC=${FABRIC_LOGGING_SPEC}
-      - CORE_OPERATIONS_LISTENADDRESS=0.0.0.0:8080
+      - CORE_OPERATIONS_LISTENADDRESS=0.0.0.0:{{ peer.ports.exporter or "8080" }}
       - CORE_OPERATIONS_TLS_ENABLED=false
       - CORE_METRICS_PROVIDER=prometheus
       - CORE_PEER_ID={{ peer.name }}.{{ org.domain }}
       - CORE_PEER_LOCALMSPID={{ org.mspid }}
-      - CORE_PEER_ADDRESS={{ peer.name }}.{{ org.domain }}:7051
-      - CORE_PEER_LISTENADDRESS=0.0.0.0:7051
-      - CORE_PEER_GOSSIP_BOOTSTRAP=peer1.{{ org.domain }}:7051
-      #- CORE_PEER_GOSSIP_EXTERNALENDPOINT={{ peer.name }}.{{ org.domain }}:7051
-      {% if peer.name == "peer1" %}
-      - CORE_PEER_GOSSIP_USELEADERELECTION=false
-      - CORE_PEER_GOSSIP_ORGLEADER=true
-      {% else %}
-      - CORE_PEER_GOSSIP_USELEADERELECTION=false
-      - CORE_PEER_GOSSIP_ORGLEADER=false
-      {% endif %}
+      - CORE_PEER_ADDRESS={{ peer.name }}.{{ org.domain }}:{{ peer.ports.requests }}
+      - CORE_PEER_LISTENADDRESS=0.0.0.0:{{ peer.ports.requests }}
+      - CORE_PEER_GOSSIP_EXTERNALENDPOINT={{ peer.name }}.{{ org.domain }}:{{ peer.ports.requests }}
+      - CORE_PEER_GOSSIP_USELEADERELECTION={% if org.useLeaderElection %}true{% else %}false{% endif %}
+      {%- for bootstrap in org.peers %}
+      {%- if bootstrap.name == peer.bootstrap %}
+      - CORE_PEER_GOSSIP_BOOTSTRAP={{ bootstrap.name }}.{{ org.name }}.{{ org.domain }}:{{ bootstrap.ports.requests }}
+      {% if not org.useLeaderElection %}- CORE_PEER_GOSSIP_ORGLEADER={% if bootstrap.name == peer.name %}true{% else %}false{% endif %}{% endif %}
+      {%- endif %}
+      {%- endfor %}
       - CORE_VM_ENDPOINT=unix:///host/var/run/docker.sock
       - CORE_VM_DOCKER_HOSTCONFIG_NETWORKMODE=${COMPOSE_PROJECT_NAME}_{{ network }}
       - CORE_CHAINCODE_BUILDER=hyperledger/fabric-ccenv:${FABRIC_TAG}
@@ -103,14 +112,29 @@ services:
       - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp:/etc/hyperledger/fabric/msp
       - ./crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/tls:/etc/hyperledger/fabric/tls
     ports:
-      - {{ peer.ports.requests }}:7051
-      - {{ peer.ports.pprof }}:6060
+      - {{ peer.ports.requests }}:{{ peer.ports.requests }}
+      {%- if peer.ports.exporter %}
+      - {{ peer.ports.exporter }}:{{ peer.ports.exporter }}
+      {%- endif %}
     networks:
       {{ network }}:
         aliases:
           - {{ peer.name }}.{{ org.domain }}
+    {%- if (ordererorg.orderers + org.peers) | selectattr('host', 'ne', peer.host) | list | length is gt 0 %}
+    extra_hosts:
+    {%- for o in ordererorg.orderers %}
+    {%- if o.host != peer.host %}
+      - {{ o.name}}.{{ ordererorg.domain }}:{{ o.host | getip }}
+    {%- endif %}
+    {%- endfor %}
+    {%- for p in org.peers %}
+    {%- if p.host != peer.host %}
+      - {{ p.name}}.{{ org.domain }}:{{ p.host | getip }}
+    {%- endif %}
+    {%- endfor %}
+    {%- endif %}
     healthcheck:
-      test: wget -q -O- http://localhost:8080/healthz | grep -q '"status":"OK"'
+      test: wget -q -O- http://localhost:{{ peer.ports.exporter or "8080" }}/healthz | grep -q '"status":"OK"'
       interval: 5s
       timeout: 5s
       retries: 0

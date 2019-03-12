@@ -2,15 +2,19 @@
 
 channel=${1:-mychannel}
 target_org=${2:-org1}
+peer="$3"
 
 peers=$(jq --arg channel "$channel" -r '.channels[$channel].peers | keys_unsorted | .[]' connection-profile.json)
 
-for peer in $peers; do
+if [ -z "$peer" ]; then
+  for peer in $peers; do
     org=$(jq --arg peer $peer -r '.organizations | to_entries[] | select(.value.peers[] | . == $peer).key' connection-profile.json)
     if [ "$org" == "$target_org" ]; then
         break
     fi
-done
+  done
+fi
+org="$target_org"
 
 mspid=$(jq --arg org $org -r '.organizations[$org] | .mspid' connection-profile.json)
 mspdir=$(jq --arg org $org -r '.organizations[$org] | .adminPrivateKey.path | sub("/[^/]*/[^/]*$";"")' connection-profile.json)
