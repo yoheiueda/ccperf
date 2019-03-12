@@ -8,5 +8,6 @@
 /*.tx
 /*.json
 /*.yaml
+/prometheus/prometheus-fabric.yml
 /FlameGraph
 /.vscode
