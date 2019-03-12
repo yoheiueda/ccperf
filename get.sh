@@ -26,4 +26,4 @@ esac
 
 docker run --rm hyperledger/fabric-tools:$FABRIC_TAG cat /etc/hyperledger/fabric/core.yaml > core.yaml
 
-[ $(docker image ls -q tinyproxy) == "" ] && (cd dockerfiles/tinyproxy && ./build.sh)
+[ "$(docker image ls -q tinyproxy)" == "" ] && (cd dockerfiles/tinyproxy && ./build.sh)
