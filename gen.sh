@@ -2,7 +2,7 @@
 
 ./applytmpl.py templates/crypto-config.yaml.tmpl > crypto-config.yaml
 
-rm -fr ./crypto-config
+rm -fr ./crypto-config/peerOrganizations/*/peers ./crypto-config/ordererOrganizations/*/orderers ./crypto-config/*Organizations/*/users/User*@*
 ./bin/cryptogen extend --config=./crypto-config.yaml --input=./crypto-config
 
 ./applytmpl.py templates/configtx.yaml.tmpl > configtx.yaml
