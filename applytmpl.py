@@ -52,7 +52,7 @@ data = {
             'domain': 'org1.' + commonDomain,
             'useLeaderElection': True,
             'peers': [
-                {'name': 'peer1', 'ports': {'requests': 7051, 'pprof': 7061 }, 'host': commonHostname},
+                {'name': 'peer1', 'ports': {'requests': 7051, 'pprof': 7061 }, 'host': commonHostname, 'bootstrap': 'peer1' },
             ]
          }
     ],
