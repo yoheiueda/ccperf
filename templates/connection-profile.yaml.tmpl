@@ -47,7 +47,6 @@ peers:
 {%- for peer in org.peers %}
   {{ peer.name }}.{{ org.domain }}:
     url: 'grpcs://{{ peer.host }}:{{ peer.ports.requests }}'
-    eventUrl: 'grpcs://{{ peer.host }}:{{ peer.ports.events }}'
     tlsCACerts:
       path: crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp/tlscacerts/tlsca.{{ org.domain }}-cert.pem
     grpcOptions:
