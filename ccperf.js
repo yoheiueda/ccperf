@@ -707,7 +707,6 @@ async function worker(config) {
     const peers = []
     for (org of orgs) {
         const orgPeers = channel.getPeersForOrg(config.profile.organizations[org].mspid).filter(p => p.isInRole("endorsingPeer"));
-        console.log('orgPeers.length', orgPeers.length);
         peers.push(orgPeers[cluster.worker.id % orgPeers.length]);
     }
 
