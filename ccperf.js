@@ -703,16 +703,12 @@ async function worker(config) {
         requestsLog.write('[\n');
     }
 
-    let peers;
-    if (config.endorsingPeerName) {
-        peers = [client.getPeer(endorsingPeerName)];
-    } else if (config.endorsingOrgs) {
-        const orgs = config.endorsingOrgs;
-        peers = []
-        for (org of orgs) {
-            const orgPeers = client.getPeersForOrg(profile.organizations[org].mspid);
-            peers.push(orgPeers[context.workerID % orgPeers.length]);
-        }
+    const orgs = config.endorsingOrgs;
+    const peers = []
+    for (org of orgs) {
+        const orgPeers = channel.getPeersForOrg(config.profile.organizations[org].mspid).filter(p => p.isInRole("endorsingPeer"));
+        console.log('orgPeers.length', orgPeers.length);
+        peers.push(orgPeers[cluster.worker.id % orgPeers.length]);
     }
 
     const histgramEndorsement = new prom.Histogram({
@@ -929,7 +925,7 @@ function run(cmd) {
         processes: processes,
         target: target,
         orgName: orgName,
-        endorsingOrgs: cmd.endorsingOrgs === undefined ? undefined : cmd.endorsingOrgs.split(','),
+        endorsingOrgs: endorsingOrgs,
         peerSelection: cmd.peerSelection,
         ordererSelection: cmd.ordererSelection,
         committingPeerName: cmd.committingPeer,
