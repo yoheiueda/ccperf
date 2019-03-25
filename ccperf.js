@@ -137,7 +137,8 @@ class LocalDriver {
 
     async init() {
         const driver = this;
-        const completedPromises = [];
+        const completionPromises = [];
+        const exitedPromises = [];
         const numProcesses = this.config.processes / this.config.remotes.length;
         const configAckPromises = [];
 
@@ -163,9 +164,17 @@ class LocalDriver {
                 }
             });
 
-            completedPromises.push(new Promise(resolve => w.on('disconnect', resolve)));
+            completionPromises.push(new Promise(resolve => {
+                w.on('message', msg => {
+                    if (msg.type == 'completed') {
+                        resolve(msg);
+                    }
+                });
+            }));
 
-            completedPromises.push(new Promise((resolve, reject) => {
+            exitedPromises.push(new Promise(resolve => w.on('disconnect', resolve)));
+
+            exitedPromises.push(new Promise((resolve, reject) => {
                 w.on('exit', (code, signal) => {
                     if (signal) {
                         reject(`Worker ${w.id} is killed by ${signal}`);
@@ -195,13 +204,14 @@ class LocalDriver {
             });
         }
 
-        this.completedPromise = Promise.all(completedPromises);
+        this.completionPromise = Promise.all(completionPromises);
+        this.exitedPromise = Promise.all(exitedPromises);
 
         return Promise.all(configAckPromises);;
     }
 
     async waitCompletion() {
-        return this.completedPromise;
+        return this.completionPromise;
     }
 
     async start(startTime) {
@@ -212,6 +222,15 @@ class LocalDriver {
                 startTime: startTime
             });
         }
+    }
+
+    async exit() {
+        for (const id in cluster.workers) {
+            const w = cluster.workers[id];
+            w.send({ type: 'exit' });
+
+        }
+        return this.exitedPromise;
     }
 
     async collectMetrics() {
@@ -574,6 +593,13 @@ async function master(config) {
         blocksLog.close();
     }
     //await printStats(blockTable, txTable);
+
+    const exitPromises = [];
+    for (const driver of drivers) {
+        const p = driver.exit();
+        exitPromises.push(p);
+    }
+    await Promise.all(exitPromises);
 }
 
 function getAccount(max) {
@@ -813,6 +839,8 @@ async function worker(config) {
         }
     }
 
+    process.send({ type: 'completed' });
+
     //console.log(info.index/duration*1000);
 
     if (config.logdir) {
@@ -820,7 +848,13 @@ async function worker(config) {
         requestsLog.close();
     }
 
-    await sleep(5000);
+    await new Promise(resolve => {
+        process.on('message', msg => {
+            if (msg.type === 'exit') {
+                resolve(msg);
+            }
+        })
+    });
 
     process.exit(0); // Forces to close all connections
 }
