@@ -12,6 +12,9 @@ const yaml = require('js-yaml');
 const request = require('request');
 const WebSocket = require('ws');
 const glob = require('glob');
+const prom = require('prom-client');
+
+const aggregatorRegistry = new prom.AggregatorRegistry();
 
 const logger = require('winston');
 if (process.env.FABRIC_CONFIG_LOGLEVEL) {
@@ -70,35 +73,6 @@ async function getClient(profile, orgName) {
     return client;
 }
 
-
-function roundDown(num, base) {
-    return Math.floor(num / base) * base;
-}
-
-function roundUp(num, base) {
-    return roundDown(num, base) + base;
-}
-
-function percentile(list, percent) {
-    if (list.length == 0) {
-        return 0.0;
-    }
-    list.sort((a, b) => a - b);
-    nth = roundDown(list.length * percent, 1);
-    return list[nth];
-}
-
-function average(list) {
-    if (list.length == 0) {
-        return 0.0;
-    }
-    let sum = 0;
-    for (const item of list) {
-        sum += item;
-    }
-    return sum / list.length;
-}
-
 function doRequest(options) {
     return new Promise(function (resolve, reject) {
         request(options, function (error, res, body) {
@@ -149,335 +123,336 @@ async function populate(config, channel) {
     eventhub.disconnect();
 }
 
-async function monitor(config, channel, blockTable, blocksLog, txTable, metrics, prometheusConfig) {
-    if (config.prometheus) {
-        const timestamp = parseInt((config.start + config.rampup) / 1000);
-        const url = config.prometheus + '/metrics/job/fabric/run_timestamp/' + timestamp + '/duration_seconds/' + config.duration / 1000;
-
-        const requestOptions = {
-            url: url,
-            method: "PUT",
-            headers: {
-                "Content-type": "text/plain",
-            },
-            body: "ccperf_last_run_timestamp " + timestamp + "\n"
-        }
-        const res = await doRequest(requestOptions).catch(err => { throw new Error(err) });
-
-        prometheusConfig.intId = setInterval(() => {
-            const body =
-                "ccperf_endorsement_count " + metrics.endorsementCount + "\n" +
-                "ccperf_endorsement_sum " + metrics.endorsementSum / 1000 + "\n" +
-                "ccperf_sendtransaction_count " + metrics.endorsementCount + "\n" +
-                "ccperf_sendtransaction_sum " + metrics.endorsementSum / 1000 + "\n" +
-                "ccperf_commit_count_accurate " + metrics.commitCountAccurate + "\n" +
-                "ccperf_commit_count " + metrics.commitCount + "\n" +
-                "ccperf_commit_sum " + metrics.commitSum / 1000 + "\n";
-            //console.log(body);
-            const requestOptions = {
-                url: url,
-                method: "PUT",
-                headers: {
-                    "Content-type": "text/plain",
-                },
-                body: body
-            }
-            //console.log(requestOptions);
-            const p = doRequest(requestOptions).catch(err => { throw new Error(err) });
-
-        }, 1000);
-    }
-    if (config.grafana) {
-        const description = util.format("Target:%d Processes:%d Duration:%d Type:%s Num:%d Size:%d", 1000 / config.interval * config.processes, config.processes, config.duration, config.type, config.num, config.size);
-
-        const payload = {
-            "time": config.start + config.rampup,
-            "isRegion": true,
-            "timeEnd": config.start + config.rampup + config.duration,
-            "tags": ["run"],
-            "text": description
-        }
-
-        const requestOptions = {
-            url: config.grafana + '/api/annotations',
-            method: "POST",
-            headers: {
-                "Content-type": "application/json",
-            },
-            json: payload
-        }
-
-        const res = await doRequest(requestOptions).catch(err => { throw new Error(err) });
-    }
-
-    if (config.committingPeerName) {
-        let blocksLogFirst = true;
-        if (blocksLog) {
-            blocksLog.write('[\n');
-        }
-
-        const eventhub = channel.getChannelEventHub(config.committingPeerName);
-        eventhub.connect(false);
-        let prev_t = 0;
-        config.blockRegNum = eventhub.registerBlockEvent(
-            (block) => {
-                // Example data structure of a filtered block:
-                // {
-                //   "channel_id": "mychannel",
-                //   "number": "123",
-                //   "filtered_transactions": [
-                //     {
-                //       "Data": "transaction_actions",
-                //       "txid": "cd1c24b15e19e1923a1cda0fbd1a2db4528eafd6140d563e8ec9abdd5655bcc3",
-                //       "type": "ENDORSER_TRANSACTION",
-                //       "tx_validation_code": "VALID",
-                //       "transaction_actions": {
-                //         "chaincode_actions": []
-                //       }
-                //     }, ...]
-                //  }
-                const date = new Date();
-                const now = date.getTime();
-                if (prev_t == 0) {
-                    prev_t = config.start;
-                    return;
-                }
-                const txset = {}
-                for (const tx of block.filtered_transactions) {
-                    let txTypes = txset[tx.type];
-                    if (txTypes === undefined) {
-                        txTypes = {};
-                        txset[tx.type] = txTypes;
-                    }
-                    let txResults = txTypes[tx.tx_validation_code];
-                    if (txResults === undefined) {
-                        txResults = []
-                        txTypes[tx.tx_validation_code] = txResults;
-                    }
-                    txResults.push(tx.txid);
-
-                    metrics.commitCountAccurate += 1;
-
-                    if (txTable[tx.txid] !== undefined) {
-                        metrics.commitCount += 1;
-                        metrics.commitSum += now - txTable[tx.txid][2];
-                    } else {
-                        metrics.pendings.set(tx.txid, now);
-                    }
-                }
-                blockTable[block.number] = { txset: txset, timestamp: now };
-                const count = block.filtered_transactions.length;
-                const tps = count / (now - prev_t) * 1000;
-                console.error(sprintf('Block %d contains %d transaction(s). TPS is %.2f', block.number, count, tps));
-
-                if (blocksLog) {
-                    if (blocksLogFirst) {
-                        blocksLogFirst = false;
-                    } else {
-                        blocksLog.write(',\n');
-                    }
-                    blocksLog.write(JSON.stringify({ timestamp: date, block: block }, undefined, 4));
-                }
-
-                prev_t = now;
-            },
-            (err) => {
-                console.error('EventHub error ', err);
-            }
-        );
-    }
-}
-
-async function unmonitor(config, channel, blocksLog, prometheusConfig) {
-    const eventhub = channel.getChannelEventHub(config.committingPeerName);
-    eventhub.unregisterBlockEvent(config.blockRegNum);
-    eventhub.disconnect();
-    if (config.logdir) {
-        blocksLog.write('\n]\n');
-    }
-    if (prometheusConfig.intId !== undefined) {
-        clearInterval(prometheusConfig.intId);
-    }
-}
-
-async function printMetrics(blockTable, txTable) {
-
-    let min_t = Number.MAX_VALUE;
-    let max_t = 0;
-    for (const txid in txTable) {
-        const tx = txTable[txid];
-        const [t1, t2, t3] = tx;
-        if (t1 < min_t) {
-            min_t = t1;
-        }
-        if (t2 > max_t) {
-            max_t = t2;
-        }
-        if (t3 !== undefined && t3 > max_t) {
-            max_t = t3;
-        }
-    }
-
-    for (const num in blockTable) {
-        const t4 = blockTable[num].timestamp;
-        for (const txType in blockTable[num].txset) {
-            for (const code in blockTable[num].txset[txType]) {
-                for (const txid of blockTable[num].txset[txType][code]) {
-                    tx = txTable[txid];
-                    if (tx !== undefined) {
-                        tx.push(t4);
-                        if (t4 > max_t) {
-                            max_t = t4;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    const period = 5000;
-
-    min_t = roundDown(min_t, period);
-    max_t = roundUp(max_t, period);
-    const elapsed = max_t - min_t;
-
-    const latencies = [];
-
-    for (let i = 0; i < elapsed / period; i++) {
-        latencies.push({
-            peer: [],
-            orderer: [],
-            commit: [],
+class LocalDriver {
+    constructor(config, ws) {
+        this.config = config;
+        this.ws = ws;
+        this.txTable = new Map();
+        this.histgramCommit = new prom.Histogram({
+            name: 'ccperf_commit',
+            help: 'Commit latency',
+            labelNames: ['ccperf', 'type', 'tx_validation_code']
         });
     }
 
-    const begin = min_t;
+    async init() {
+        const driver = this;
+        const completedPromises = [];
+        const numProcesses = this.config.processes / this.config.remotes.length;
+        const configAckPromises = [];
 
-    for (const txid in txTable) {
-        const tx = txTable[txid];
-        const [t1, t2, t3, t4] = tx;
-        latencies[roundDown(t2 - begin, period) / period].peer.push(t2 - t1);
-        latencies[roundDown(t3 - begin, period) / period].orderer.push(t3 - t2);
-        if (t4 !== undefined) {
-            latencies[roundDown(t4 - begin, period) / period].commit.push(t4 - t3);
-        }
-    }
+        for (var i = 0; i < numProcesses; i++) {
+            this.config.delay = i * this.config.rampup / numProcesses;
+            const w = cluster.fork();
+            w.on('online', () => {
+                w.send({ type: 'config', config: this.config });
+            });
 
-    console.log(' elapsed peer.tps orderer.tps commit.tps peer.avg orderer.avg commit.avg peer.pctl orderer.pctl commit.pctl');
-    for (let i = 0; i < elapsed / period; i++) {
-        const data = {
-            elapsed: i * period / 1000,
-            peer: {
-                tps: latencies[i].peer.length / period * 1000,
-                avg: average(latencies[i].peer),
-                pctl: percentile(latencies[i].peer, 0.9)
-            },
-            orderer: {
-                tps: latencies[i].orderer.length / period * 1000,
-                avg: average(latencies[i].orderer),
-                pctl: percentile(latencies[i].orderer, 0.9)
-            },
-            commit: {
-                tps: latencies[i].commit.length / period * 1000,
-                avg: average(latencies[i].commit),
-                pctl: percentile(latencies[i].commit, 0.9)
-            }
-        };
-        s = sprintf('%(elapsed)8d %(peer.tps)8.2f %(orderer.tps)11.2f %(commit.tps)10.2f %(peer.avg)8.2f %(orderer.avg)11.2f %(commit.avg)10.2f %(peer.pctl)9.2f %(orderer.pctl)12.2f %(commit.pctl)11.2f', data);
-        console.log('%s', s);
-    }
-}
-
-async function invokeLocalWorkers(config, txTable, metrics, ws) {
-    const promises = [];
-
-    const numProcesses = config.processes / config.remotes.length;
-
-    for (var i = 0; i < numProcesses; i++) {
-        config.delay = i * config.rampup / numProcesses;
-        const w = cluster.fork();
-        w.on('online', () => {
-            w.send({ config: config });
-        });
-        if (txTable) {
-            w.on('message', (msg) => {
-                if (msg.txStats) {
-                    const txStats = msg.txStats;
-                    for (const txid in txStats) {
-                        txTable[txid] = txStats[txid];
-                        const t4 = metrics.pendings.get(txid);
-                        if (t4 !== undefined) {
-                            metrics.pendings.delete(txid);
-                            metrics.commitCount += 1;
-                            metrics.commitSum += t4 - txStats[txid][2];
-                        }
+            configAckPromises.push(new Promise(resolve => {
+                w.on('message', msg => {
+                    if (msg.type === 'configAck') {
+                        resolve(msg);
                     }
-                }
-                if (msg.metrics) {
-                    metrics.endorsementCount += msg.metrics.endorsementCount;
-                    metrics.endorsementSum += msg.metrics.endorsementSum;
-                    metrics.sendTransactionCount += msg.metrics.sendTransactionCount;
-                    metrics.sendTransactionSum += msg.metrics.sendTransactionSum;
+                });
+            }));
+
+            w.on('message', msg => {
+                if (msg.type === 'tx') {
+                    const tx = msg.tx;
+                    driver.txTable.set(tx.id, tx);
                 }
             });
-        } else {
-            w.on('message', (msg) => {
-                //TODO: Aggregate txStats and metrics here, and periodically send them to master
-                try {
-                    ws.send(JSON.stringify(msg));
-                } catch (err) {
-                    console.error(err);
+
+            completedPromises.push(new Promise(resolve => w.on('disconnect', resolve)));
+
+            completedPromises.push(new Promise((resolve, reject) => {
+                w.on('exit', (code, signal) => {
+                    if (signal) {
+                        reject(`Worker ${w.id} is killed by ${signal}`);
+                    } else if (code != 0) {
+                        reject(`Worker ${w.id} exited with return code ${code}`);
+                    } else {
+                        resolve();
+                    }
+                });
+            }));
+        }
+
+        if (this.ws !== undefined) {
+            const ws = this.ws;
+            ws.on('message', message => {
+                const msg = JSON.parse(message);
+                if (msg.command === 'colletMetrics') {
+                    driver.collectMetrics().then(metrics => {
+                        ws.send(JSON.stringify({
+                            type: 'metrics',
+                            metrics: metrics
+                        }))
+                    });
+                } else if (msg.commanmd === 'feedBlockInfo') {
+                    dreiver.feedBlockInfo(block);
                 }
             });
         }
 
-        promises.push(new Promise(resolve => w.on('disconnect', resolve)));
+        this.completedPromise = Promise.all(completedPromises);
 
-        promises.push(new Promise((resolve, reject) => {
-            w.on('exit', (code, signal) => {
-                if (signal) {
-                    reject(`Worker ${w.id} is killed by ${signal}`);
-                } else if (code != 0) {
-                    reject(`Worker ${w.id} exited with return code ${code}`);
+        return Promise.all(configAckPromises);;
+    }
+
+    async waitCompletion() {
+        return this.completedPromise;
+    }
+
+    async start(startTime) {
+        for (const id in cluster.workers) {
+            const w = cluster.workers[id];
+            w.send({
+                type: 'start',
+                startTime: startTime
+            });
+        }
+    }
+
+    async collectMetrics() {
+        const sum = this.histgramCommit.hashMap['ccperf:test,tx_validation_code:VALID,type:ENDORSER_TRANSACTION'].sum;
+        const count = this.histgramCommit.hashMap['ccperf:test,tx_validation_code:VALID,type:ENDORSER_TRANSACTION'].count;
+        const commitMetricString = `
+# HELP ccperf_commit Endorsement latency
+# TYPE ccperf_commit histogram
+ccperf_commit_sum{ccperf="test"} ${sum}
+ccperf_commit_count{ccperf="test"} ${count}
+`;
+        //console.log(commitMetricString);
+        return new Promise((resolve, reject) => {
+            aggregatorRegistry.clusterMetrics((err, metricsStr) => {
+                metricsStr += commitMetricString;
+                if (err) {
+                    reject(err);
                 } else {
-                    resolve();
+                    resolve(decodeMetricsString(metricsStr));
                 }
             });
+        });
+    }
+
+    async feedBlockInfo(block) {
+        // Example data structure of a filtered block:
+        // {
+        //   "channel_id": "mychannel",
+        //   "number": "123",
+        //   "filtered_transactions": [
+        //     {
+        //       "Data": "transaction_actions",
+        //       "txid": "cd1c24b15e19e1923a1cda0fbd1a2db4528eafd6140d563e8ec9abdd5655bcc3",
+        //       "type": "ENDORSER_TRANSACTION",
+        //       "tx_validation_code": "VALID",
+        //       "transaction_actions": {
+        //         "chaincode_actions": []
+        //       }
+        //     }, ...]
+        //  }
+        const now = Date.now();
+
+        for (const commit of block.filtered_transactions) {
+            const txid = commit.txid;
+            const tx = this.txTable.get(txid);
+            if (tx !== undefined) {
+                this.txTable.delete(txid);
+                const msLatency = now - tx.timestamp;
+                const labels = {
+                    "ccperf": "test",
+                    "type": commit.type,
+                    "tx_validation_code": commit.tx_validation_code
+                }
+                this.histgramCommit.observe(labels, msLatency / 1000);
+            }
+        }
+    }
+}
+
+
+class RemoteDriver {
+    constructor(config, remote) {
+        this.config = config;
+        const hostport = remote.split(':');
+        const host = hostport[0];
+        const port = Number(hostport[1]);
+        this.url = `ws://${host}:${port}`;
+    }
+
+    async init() {
+        this.ws = new WebSocket(url);
+        this.metricsQueue = []; // FIXME: Use requsest id instead of queqing
+
+        this.ws.on('message', message => {
+            const msg = JSON.parse(message);
+            if (msg.type == 'metrics') {
+                const resolve = this.metricsQueue.shift();
+                if (resolve !== undefined) {
+                    resolve(msg.metrics);
+                }
+            }
+        });
+
+        await new Promise(resolve => ws.on('open', resolve));
+
+        this.ws.send(JSON.stringify({ command: 'start', config: config }));
+
+        return new Promise(resolve => ws.on('close', resolve));
+    }
+
+    async collectMetrics() {
+        const promise = new Promise((resolve, reject) => {
+            this.metricsQueue.push(resolve);
+        });
+        this.ws.send(JSON.stringify({ command: 'colletMetrics' }));
+        return promise;
+    }
+
+    async feedBlockInfo(block) {
+        this.ws.send(JSON.stringify({
+            command: 'feedBlockInfo',
+            block: block
         }));
     }
-
-    return Promise.all(promises);
 }
 
-async function invokeRemoteWorkers(config, remote, txTable, metrics) {
-    const hostport = remote.split(':');
-    const host = hostport[0];
-    const port = Number(hostport[1]);
-    const url = `ws://${host}:${port}`;
+function decodeMetricsString(metricsStr) {
+    const metricsTable = {};
 
-    const ws = new WebSocket(url);
-
-    ws.on('message', message => {
-        const json = JSON.parse(message);
-        if (json.txStats) {
-            const txStats = json.txStats;
-            for (const txid in txStats) {
-                txTable[txid] = txStats[txid];
+    for (const metric of metricsStr.split('\n\n')) {
+        let name;
+        for (const line of metric.split('\n')) {
+            const items = line.split(' ');
+            if (items[0] === '#') {
+                name = items[2]
+                let metricObj = metricsTable[name];
+                if (metricObj === undefined) {
+                    metricObj = { values: {} }
+                    metricsTable[name] = metricObj;
+                }
+                if (items[1] === 'HELP') {
+                    metricObj.help = items.slice(3).join(' ');
+                } else if (items[1] === 'TYPE') {
+                    metricObj.type = items[3];
+                }
+            } else if (items[0] !== '') {
+                const metricObj = metricsTable[name];
+                const fullname = items[0];
+                metricObj.values[fullname] = Number(items[1]);
             }
         }
-        if (json.metrics) {
-            metrics.endorsementCount += json.metrics.endorsementCount;
-            metrics.endorsementSum += json.metrics.endorsementSum;
-            metrics.sendTransactionCount += json.metrics.sendTransactionCount;
-            metrics.sendTransactionSum += json.metrics.sendTransactionSum;
+    }
+
+    return metricsTable;
+}
+
+function encodeMetricsString(metrics) {
+    let str = '';
+
+    for (const name of Object.keys(metrics)) {
+        const metric = metrics[name];
+        str += `# HELP ${name} ${metric.help}\n`
+        str += `# TYPE ${name} ${metric.type}\n`
+
+        const keys = Object.keys(metric.values);
+        if (keys.length > 0) {
+            for (const key of keys) {
+                const value = metric.values[key];
+                str += `${key} ${value}\n`
+            }
         }
-    });
 
-    await new Promise(resolve => ws.on('open', resolve));
+        str += '\n';
+    }
 
-    ws.send(JSON.stringify({ command: 'start', config: config }));
+    return str;
+}
 
-    return new Promise(resolve => ws.on('close', resolve));
+function aggregateMetrics(metricsArray) {
+    const metricsTable = {};
+
+    for (const metrics of metricsArray) {
+        for (const name of Object.keys(metrics)) {
+            const metric = metrics[name];
+            let metricObj = metricsTable[name];
+            if (metricObj === undefined) {
+                metricObj = {
+                    help: metric.help,
+                    type: metric.type,
+                    values: {}
+                };
+                metricsTable[name] = metricObj
+            };
+            for (const fullname of Object.keys(metric.values)) {
+                let oldValue = metricObj.values[fullname];
+                if (oldValue === undefined) {
+                    oldValue = 0.0;
+                }
+                metricObj.values[fullname] = oldValue + metric.values[fullname];
+            }
+        }
+    }
+
+    return metricsTable;
+}
+
+function delta(name, key, current, prev) {
+    const fullname = name + "_" + key;
+    if (current[name] === undefined || prev[name] === undefined) {
+        return NaN;
+    }
+    return current[name].values[fullname] - prev[name].values[fullname];
+}
+
+function printMetricsHeading(interval, elapsed, current, prev) {
+    //console.log(' elapsed peer.tps orderer.tps commit.tps peer.avg orderer.avg commit.avg peer.pctl orderer.pctl commit.pctl');
+    console.log(' elapsed peer.tps orderer.tps commit.tps peer.avg orderer.avg commit.avg');
+}
+
+function printMetrics(interval, elapsed, current, prev) {
+    const data = {
+        elapsed: elapsed,
+        peer: {
+            tps: delta('ccperf_endorsement', 'count{ccperf="test"}', current, prev) / interval,
+            avg: 1000 * delta('ccperf_endorsement', 'sum{ccperf="test"}', current, prev) / delta('ccperf_endorsement', 'count{ccperf="test"}', current, prev),
+            pctl: 0
+        },
+        orderer: {
+            tps: delta('ccperf_sendtransaction', 'count{ccperf="test"}', current, prev) / interval,
+            avg: 1000 * delta('ccperf_sendtransaction', 'sum{ccperf="test"}', current, prev) / delta('ccperf_sendtransaction', 'count{ccperf="test"}', current, prev),
+            pctl: 0
+        },
+        commit: {
+            tps: delta('ccperf_commit', 'count{ccperf="test"}', current, prev) / interval,
+            avg: 1000 * delta('ccperf_commit', 'sum{ccperf="test"}', current, prev) / delta('ccperf_commit', 'count{ccperf="test"}', current, prev),
+            pctl: 0
+        }
+    };
+    //s = sprintf('%(elapsed)8d %(peer.tps)8.2f %(orderer.tps)11.2f %(commit.tps)10.2f %(peer.avg)8.2f %(orderer.avg)11.2f %(commit.avg)10.2f %(peer.pctl)9.2f %(orderer.pctl)12.2f %(commit.pctl)11.2f', data);
+    s = sprintf('%(elapsed)8d %(peer.tps)8.2f %(orderer.tps)11.2f %(commit.tps)10.2f %(peer.avg)8.2f %(orderer.avg)11.2f %(commit.avg)10.2f', data);
+    console.log('%s', s);
+
+}
+
+function setupEventHub(config, channel, handler) {
+    const eventhub = channel.getChannelEventHub(config.committingPeerName);
+    eventhub.connect(false);
+
+    config.blockRegNum = eventhub.registerBlockEvent(
+        handler,
+        (err) => {
+            console.error('EventHub error ', err);
+        }
+    );
+    return config.blockRegNum;
+}
+
+function shutdownEventHub(config, channel, blockRegNum) {
+    const eventhub = channel.getChannelEventHub(config.committingPeerName);
+    eventhub.unregisterBlockEvent(blockRegNum);
+    eventhub.disconnect();
 }
 
 async function master(config) {
@@ -488,20 +463,6 @@ async function master(config) {
         await populate(config);
     }
 
-    config.start = Date.now() + 5000;
-    const blockTable = {};
-
-    const txTable = {};
-    const metrics = {
-        endorsementCount: 0,
-        endorsementSum: 0,
-        sendTransactionCount: 0,
-        sendTransactionSum: 0,
-        commitCountAccurate: 0,
-        commitCount: 0,
-        commitSum: 0,
-        pendings: new Map()
-    };
     const prometheusConfig = {};
 
     let blocksLog;
@@ -509,40 +470,110 @@ async function master(config) {
         if (config.committingPeer && config.logdir) {
             const blocksLogPath = config.logdir + '/blocks.json';
             blocksLog = fs.createWriteStream(blocksLogPath, { flags: 'wx' });
+            blocksLog.write('[\n');
+            blocksLog.firstWriteFlag = true;
         }
-        await monitor(config, channel, blockTable, blocksLog, txTable, metrics, prometheusConfig);
+        //await monitor(config, channel, prometheusConfig);
     }
 
+    const drivers = [];
     const promises = [];
     for (const remote of config.remotes) {
-        let promise;
+        let driver;
         if (remote === "local") {
-            promise = invokeLocalWorkers(config, txTable, metrics);
+            console.log('Creating local driver');
+            driver = new LocalDriver(config);
+
         } else {
-            promise = invokeRemoteWorkers(config, remote, txTable, metrics);
+            driver = new RemoteDriver(config, remote);
         }
+        drivers.push(driver);
+        const promise = driver.init();
         promises.push(promise);
     }
 
+    let blockRegNum;
+    if (config.committingPeerName) {
+        blockRegNum = setupEventHub(config, channel, block => {
+            for (const driver of drivers) {
+                driver.feedBlockInfo(block);
+            }
+            if (blocksLog) {
+                if (blocksLog.firstWriteFlag) {
+                    blocksLog.firstWriteFlag = false;
+                } else {
+                    blocksLog.write(',\n');
+                }
+                blocksLog.write(JSON.stringify({ timestamp: now, block: block }, undefined, 4));
+            }
+        });
+    }
     await Promise.all(promises);
 
-    await sleep(3000);
+    const startTime = Date.now() + 1000;
+    for (const driver of drivers) {
+        driver.start(startTime);
+    }
+
+    console.log('Started workers');
+    const interval = 5000.0;
+    let previousMetrics;
+    let elapsed = 0.0;
+
+    await sleep(startTime + config.rampup - Date.now());
+
+    {
+        const promises = [];
+        for (const driver of drivers) {
+            promises.push(driver.collectMetrics());
+        }
+        Promise.all(promises).then(metricsArray => {
+            previousMetrics = aggregateMetrics(metricsArray);
+        });
+    }
+
+    const promInt = setInterval(() => {
+        const promises = [];
+        for (const driver of drivers) {
+            promises.push(driver.collectMetrics());
+        }
+
+        Promise.all(promises).then(metricsArray => {
+            const currentMetrics = aggregateMetrics(metricsArray);
+            //console.log(encodeMetricsString(currentMetrics));
+            if (previousMetrics !== undefined) {
+                printMetrics(interval / 1000, elapsed, currentMetrics, previousMetrics);
+            }
+            previousMetrics = currentMetrics;
+            elapsed += interval / 1000;
+        });
+    }, interval);
+
+    await Promise.all(promises);
 
     // info = await channel.queryInfo();
     // height = Number(info.height)
     // block = await channel.queryBlock(height-1);
 
+    console.log('Start: ', startTime + config.rampup);
+    console.log('End: ', startTime + config.rampup + config.duration);
+
+    printMetricsHeading();
+
+    for (const driver of drivers) {
+        await driver.waitCompletion();
+    }
+
+    clearInterval(promInt);
+
     if (config.committingPeerName) {
-        await unmonitor(config, channel, blocksLog, prometheusConfig);
+        shutdownEventHub(config, channel, blockRegNum);
+        //await unmonitor(config, channel, blocksLog, prometheusConfig);
     }
     if (blocksLog) {
         blocksLog.close();
     }
-
-
-    console.log('Start: ', config.start + config.rampup);
-    console.log('End: ', config.start + config.rampup + config.duration);
-    await printMetrics(blockTable, txTable);
+    //await printStats(blockTable, txTable);
 }
 
 function getAccount(max) {
@@ -552,19 +583,19 @@ function getAccount(max) {
 
 const handlerTable = {
     'putstate': {
-	'chaincodeId': 'ccperf',
+        'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
     },
     'getstate': {
-	'chaincodeId': 'ccperf',
+        'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
     },
     'mix': {
-	'chaincodeId': 'ccperf',
+        'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
     },
     'json': {
-	'chaincodeId': 'ccperf',
+        'chaincodeId': 'ccperf',
         'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
     }
 }
@@ -577,7 +608,7 @@ async function execute(context) {
         console.log('client=', client);
         channel = client.getChannel();
     }
-    const txStats = context.txStats;
+
 
     const tx_id = client.newTransactionID();
 
@@ -592,16 +623,13 @@ async function execute(context) {
         request.transientMap = context.genTransientMap(context);
     }
 
-    const t1 = new Date();
+    const t1 = Date.now();
 
     const results = await channel.sendTransactionProposal(request);
 
-    const t2 = new Date();
+    const t2 = Date.now();
 
-    if (context.metrics) {
-        context.metrics.endorsementCount += 1;
-        context.metrics.endorsementSum += t2 - t1;
-    }
+    context.histgramEndorsement.observe({ "ccperf": "test" }, (t2 - t1) / 1000);
 
     const proposalResponses = results[0];
 
@@ -629,14 +657,18 @@ async function execute(context) {
 
     orderer_results = await channel.sendTransaction(orderer_request);
 
-    const t3 = new Date();
+    const t3 = Date.now();
 
-    if (context.metrics) {
-        context.metrics.sendTransactionCount += 1;
-        context.metrics.sendTransactionSum += t3 - t2;
-    }
+    context.histgramSendTransaction.observe({ "ccperf": "test" }, (t3 - t2) / 1000);
 
-    txStats[tx_id.getTransactionID()] = [t1.getTime(), t2.getTime(), t3.getTime()];
+    process.send({
+        type: 'tx',
+        tx: {
+            id: tx_id.getTransactionID(),
+            timestamp: t3
+        }
+    });
+
     if (context.requestsLog) {
         if (context.index > 0) {
             context.requestsLog.write(',\n');
@@ -647,12 +679,6 @@ async function execute(context) {
     context.index += 1;
 }
 
-function reportPrometheusMetrics(context) {
-    const txStats = context.txStats;
-    context.txStats = {};
-    //console.log(context.metrics);
-    process.send({ metrics: context.metrics, txStats: txStats });
-}
 
 async function worker(config) {
     const client = await getClient(config.profile, config.orgName);
@@ -689,17 +715,32 @@ async function worker(config) {
         }
     }
 
+    const histgramEndorsement = new prom.Histogram({
+        name: 'ccperf_endorsement',
+        help: 'Endorsement latency',
+        labelNames: ['ccperf']
+    });
+    const histgramSendTransaction = new prom.Histogram({
+        name: 'ccperf_sendtransaction',
+        help: 'SendTransaction latency',
+        labelNames: ['ccperf']
+    });
+    const digestCommits = null;
+
     const context = {
         config: config,
         client: client,
         channel: channel,
-	chaincodeId: chaincodeId,
+        chaincodeId: chaincodeId,
         peers: peers,
         txStats: txStats,
         workerID: cluster.worker.id,
         index: 0,
         genArgs: genArgs,
-        requestsLog: requestsLog
+        requestsLog: requestsLog,
+        histgramEndorsement: histgramEndorsement,
+        histgramSendTransaction: histgramSendTransaction,
+        digestCommits: digestCommits
     };
 
     if (config.ordererSelection == 'balance') {
@@ -713,7 +754,7 @@ async function worker(config) {
     }
 
     if (config.clientKeys) {
-	const clientKeys = config.clientKeys;
+        const clientKeys = config.clientKeys;
         const userClients = [];
         const keys = glob.sync(clientKeys + '/*');
         for (keyfile of keys) {
@@ -738,26 +779,19 @@ async function worker(config) {
         info.userClients = userClients;
     }
 
-    let intId;
-    if (config.prometheus) {
-        context.metrics = {
-            endorsementCount: 0,
-            endorsementSum: 0,
-            sendTransactionCount: 0,
-            sendTransactionSum: 0
-        };
-        intId = setInterval(() => {
-            reportPrometheusMetrics(context);
-            context.metrics = {
-                endorsementCount: 0,
-                endorsementSum: 0,
-                sendTransactionCount: 0,
-                sendTransactionSum: 0
-            };
-        }, 1000);
-    }
+    const promise = new Promise(resolve => {
+        process.once('message', msg => {
+            if (msg.type === 'start') {
+                resolve(msg.startTime);
+            }
+        })
+    });
 
-    const wait = config.start + config.delay - Date.now();
+    process.send({ type: 'configAck' });
+
+    const startTime = await promise;
+
+    const wait = startTime + config.delay - Date.now();
     if (wait > 0) {
         await sleep(wait);
     }
@@ -766,7 +800,7 @@ async function worker(config) {
     //await sleep(duration);
     //clearInterval(timeout);
 
-    const end = config.start + config.rampup + config.duration + config.rampdown;
+    const end = startTime + config.rampup + config.duration + config.rampdown;
     let behind = 0;
     while (true) {
         const before = Date.now();
@@ -786,19 +820,12 @@ async function worker(config) {
 
     //console.log(info.index/duration*1000);
 
-    if (config.prometheus) {
-        clearInterval(intId);
-        reportPrometheusMetrics(context);
-    }
-
-    await new Promise(resolve => {
-        process.send({ txStats: txStats }, null, {}, resolve);
-    });
-
     if (config.logdir) {
         requestsLog.write('\n]\n');
         requestsLog.close();
     }
+
+    await sleep(5000);
 
     process.exit(0); // Forces to close all connections
 }
@@ -910,8 +937,8 @@ function run(cmd) {
         num: cmd.num === undefined ? 1 : Number(cmd.num),
         size: cmd.size === undefined ? 1 : Number(cmd.size),
         population: cmd.population === undefined ? undefined : Number(cmd.population),
-	txHandler: txHandlerStr,
-	clientKeys: cmd.clientKeys,
+        txHandler: txHandlerStr,
+        clientKeys: cmd.clientKeys,
         grafana: cmd.grafana,
         prometheus: cmd.prometheusPushgateway,
         duration: duration,
@@ -947,6 +974,12 @@ function daemon(cmd) {
                     console.log('Start %d workers', json.config.processes);
                     invokeLocalWorkers(config, null, null, ws).then(() => { ws.close() });
                     break;
+                case 'metrics':
+                    aggregatorRegistry.clusterMetrics((err, metricsStr) => {
+                        if (err) console.log(err);
+                        const metrics = decodeMetricsString(metricsStr);
+                        ws.send(JSON.stringify({ type: 'metrics', metrics: metrics }));
+                    });
             }
         });
         return;
@@ -961,11 +994,11 @@ function main() {
         });
 
         const promise = new Promise((resolve, reject) => {
-            cluster.worker.on('message', msg => {
-                if (msg !== undefined && msg.config !== undefined) {
+            cluster.worker.once('message', msg => {
+                if (msg !== undefined && msg.type === 'config' && msg.config !== undefined) {
                     resolve(msg.config)
                 } else {
-                    reject('Worker process receives an unknown mesasge from master process');
+                    reject(util.format('Worker process receives an unknown mesasge from master process: %j', msg));
                 }
             });
         });
@@ -993,14 +1026,14 @@ function main() {
         .option('--num [number]', "Number of operations per transaction")
         .option('--size [bytes]', "Payload size of a PutState call")
         .option('--population [number]', "Number of prepopulated key-values")
-	.option('--tx-plugin', "JavaScript file that defines transaction handler")
+        .option('--tx-plugin', "JavaScript file that defines transaction handler")
         .option('--committing-peer [name]', "Peer name whose commit events are monitored ")
         .option('--endorsing-orgs [org1,org2]', 'Comma-separated list of organizations')
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
         .option('--grafana [url]', "Grafana endpoint URL ")
         .option('--prometheus-pushgateway [url]', "Prometheus endpoint URL ")
         .option('--remote [hostport]', "Remote worker daemons. Comma-separated list of host:port or local")
-	.option('--client-keys [dir]', 'Directory for client keys')
+        .option('--client-keys [dir]', 'Directory for client keys')
         .action(run);
 
     program.command('daemon')
