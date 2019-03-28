@@ -858,8 +858,8 @@ class Worker {
         if (this.config.clientKeystore !== undefined) {
             this.cryptoSuite = sdk.newCryptoSuite();
             const cryptoKeyStore = sdk.newCryptoKeyStore(undefined, { path: config.clientKeystore });
-            cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
-            this.newStore = sdk.newDefaultKeyValueStore({ path: config.clientKeystore });
+            this.cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
+            this.stateStore = await sdk.newDefaultKeyValueStore({ path: config.clientKeystore });
         }
 
         const orgs = config.endorsingOrgs;
@@ -936,24 +936,23 @@ class Worker {
         let client = this.client;
         let channel = this.channel;
 
+	let username;
         if (this.config.clientKeystore !== undefined) {
-            const cryptoSuite = sdk.newCryptoSuite();
-            const cryptoKeyStore = sdk.newCryptoKeyStore(undefined, { path: config.clientKeystore });
-            cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
-
-            const newStore = sdk.newDefaultKeyValueStore({ path: config.clientKeystore });
-
-            client = new Client();
+	    //client = sdk.loadFromConfig(this.config.profile);
+            client = new sdk();
             client._network_config = this.client._network_config; //FIXME
-            client.setCryptoSuite(cryptoSuite);
-            client.setStateStore(newStore);
+            client.setCryptoSuite(this.cryptoSuite);
+            client.setStateStore(this.stateStore);
 
-            const userName = this.getUserName(this);
-            const user = await client.genUserName(userName);
-            if (!user) {
-                throw new Error("User not found in keystore: " + userName);
+            username = this.genUserName(this);
+            const user = await client.getUserContext(username, true);
+            if (!(user && user.isEnrolled())) {
+                throw new Error("User not found in keystore: " + username);
             }
+            const oldClientContext = client._network_config._client_context;
+            client._network_config._client_context = client;
             channel = client.getChannel(this.config.channelID);
+            client._network_config._client_context = oldClientContext;
         }
 
         const tx_id = client.newTransactionID();
@@ -962,7 +961,7 @@ class Worker {
             targets: this.peers,
             chaincodeId: this.chaincodeId,
             fcn: this.fcn,
-            args: this.genArgs(this),
+            args: this.genArgs(this, username),
             txId: tx_id
         };
 
