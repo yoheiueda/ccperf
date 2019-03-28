@@ -799,7 +799,8 @@ class DefaultChaincodeTxPlugin {
             isQuery: false,
             fcn: txType,
             genArgs: this._genArgsTable[txType],
-            genTransientMap: undefined
+            genTransientMap: undefined,
+            genUserName: undefined,
         };
     }
 }
@@ -823,6 +824,7 @@ class Worker {
         this.fcn = handler.fcn;
         this.genArgs = handler.genArgs;
         this.genTransientMap = handler.genTransientMap;
+        this.genUserName = handler.genUserName;
 
         if (config.logdir) {
             const requestsLogPath = config.logdir + '/requests-' + cluster.worker.id + '.json';
@@ -853,6 +855,13 @@ class Worker {
         this.client = await getClient(config.profile, config.orgName);
         this.channel = this.client.getChannel(config.channelID);
 
+        if (this.config.clientKeystore !== undefined) {
+            this.cryptoSuite = sdk.newCryptoSuite();
+            const cryptoKeyStore = sdk.newCryptoKeyStore(undefined, { path: config.clientKeystore });
+            cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
+            this.newStore = sdk.newDefaultKeyValueStore({ path: config.clientKeystore });
+        }
+
         const orgs = config.endorsingOrgs;
         this.peers = []
         for (const org of orgs) {
@@ -864,32 +873,6 @@ class Worker {
             const orderers = this.channel.getOrderers();
             const orderer = orderers[cluster.worker.id % orderers.length];
             this.orderer = orderer.getName();
-        }
-
-        if (config.clientKeys) {
-            const clientKeys = config.clientKeys;
-            const userClients = [];
-            const keys = glob.sync(clientKeys + '/*');
-            for (keyfile of keys) {
-                if (keyfile.endsWith('-pub') || keyfile.endsWith('-priv')) {
-                    continue;
-                }
-                const json = JSON.parse(loadFile(keyfile));
-                const ski = json.enrollment.signingIdentity;
-                const userOpts = {
-                    username: json.name,
-                    mspid: json.mspid,
-                    cryptoContent: {
-                        signedCertPEM: json.enrollment.identity.certificate,
-                        privateKeyPEM: loadFile(clientKeys + '/' + ski + '-priv')
-                    },
-                    skipPersistence: false
-                };
-                const userClient = await getClient(config.profile, config.orgName);
-                const user = await userClient.createUser(userOpts);
-                userClients.push(userClient);
-            }
-            this.userClients = userClients;
         }
 
         const promise = new Promise(resolve => {
@@ -950,12 +933,27 @@ class Worker {
     }
 
     async execute() {
-        const client = this.client;
-        const channel = this.channel;
-        if (this.userClients) {
-            client = info.userClients[(this.workerID * 41 + this.index * 601) % this.userClients.length];
-            console.log('client=', client);
-            channel = client.getChannel();
+        let client = this.client;
+        let channel = this.channel;
+
+        if (this.config.clientKeystore !== undefined) {
+            const cryptoSuite = sdk.newCryptoSuite();
+            const cryptoKeyStore = sdk.newCryptoKeyStore(undefined, { path: config.clientKeystore });
+            cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
+
+            const newStore = sdk.newDefaultKeyValueStore({ path: config.clientKeystore });
+
+            client = new Client();
+            client._network_config = this.client._network_config; //FIXME
+            client.setCryptoSuite(cryptoSuite);
+            client.setStateStore(newStore);
+
+            const userName = this.getUserName(this);
+            const user = await client.genUserName(userName);
+            if (!user) {
+                throw new Error("User not found in keystore: " + userName);
+            }
+            channel = client.getChannel(this.config.channelID);
         }
 
         const tx_id = client.newTransactionID();
@@ -1106,7 +1104,7 @@ function run(cmd) {
         size: cmd.size === undefined ? 1 : Number(cmd.size),
         population: cmd.population === undefined ? undefined : Number(cmd.population),
         txPluginStr: txPluginStr,
-        clientKeys: cmd.clientKeys,
+        clientKeystore: cmd.clientKeystore,
         grafana: cmd.grafana,
         prometheus: cmd.prometheusPushgateway,
         duration: duration,
@@ -1187,7 +1185,7 @@ function main() {
         .option('--grafana [url]', "Grafana endpoint URL ")
         .option('--prometheus-pushgateway [url]', "Prometheus endpoint URL ")
         .option('--remote [hostport]', "Remote worker daemons. Comma-separated list of host:port or local")
-        .option('--client-keys [dir]', 'Directory for client keys')
+        .option('--client-keystore [dir]', 'Keystore for client keys')
         .action(run);
 
     program.command('daemon')
