@@ -160,10 +160,12 @@ async function populate(config, channel) {
 class LocalDriver {
     constructor() {
         this.txTable = new Map();
+        this.registry = new prom.Registry()
         this.histgramCommit = new prom.Histogram({
             name: 'ccperf_commit',
             help: 'Commit latency',
-            labelNames: ['ccperf', 'type', 'tx_validation_code']
+            labelNames: ['ccperf', 'type', 'tx_validation_code'],
+            registers: [this.registry]
         });
     }
 
@@ -192,10 +194,12 @@ class LocalDriver {
                     driver.exit().then(() => {
                         ws.close();
                     });
+                    break;
                 case 'colletMetrics':
                     driver.collectMetrics().then(metrics => {
                         ws.send(JSON.stringify({
                             type: 'metrics',
+                            requestId: msg.requestId,
                             metrics: metrics
                         }));
                     });
@@ -294,7 +298,7 @@ class LocalDriver {
     }
 
     async collectMetrics() {
-        const commitMetricString = prom.register.getSingleMetricAsString('ccperf_commit');
+        const commitMetricString = this.registry.getSingleMetricAsString('ccperf_commit');
 
         return new Promise((resolve, reject) => {
             aggregatorRegistry.clusterMetrics((err, metricsStr) => {
@@ -369,7 +373,8 @@ class RemoteDriver {
         const driver = this;
         const ws = new WebSocket(this.url);
         this.ws = ws;
-        this.metricsQueue = []; // FIXME: Use requsest id instead of queqing
+        this.metricRequests = new Map();
+        this.metricRequestCount = 0;
 
         ws.on('message', message => {
             driver.handler(message);
@@ -390,9 +395,12 @@ class RemoteDriver {
         });
 
         this.handlers['metrics'] = msg => {
-            const resolve = driver.metricsQueue.shift();
-            if (resolve !== undefined) {
-                resolve(msg.metrics);
+            const request = this.metricRequests.get(msg.requestId);
+            if (request !== undefined) {
+                this.metricRequests.delete(msg.requestId);
+                request.done(msg.metrics);
+            } else {
+                console.error('Unknown metricRequestId: ', msg.requestId);
             }
         };
 
@@ -420,10 +428,18 @@ class RemoteDriver {
     }
 
     async collectMetrics() {
+        const driver = this;
+        const requestId = this.metricRequestCount++;
         const promise = new Promise((resolve, reject) => {
-            this.metricsQueue.push(resolve);
+            const request = {
+                done: resolve
+            }
+            driver.metricRequests.set(requestId, request);
         });
-        this.ws.send(JSON.stringify({ type: 'colletMetrics' }));
+        driver.ws.send(JSON.stringify({
+            type: 'colletMetrics',
+            requestId: requestId
+        }));
         return promise;
     }
 
@@ -739,15 +755,20 @@ class Worker {
             this.requestsLog.write('[\n');
         }
 
+        this.registry = new prom.Registry();
+        prom.AggregatorRegistry.setRegistries([this.registry]);
+
         this.histgramEndorsement = new prom.Histogram({
             name: 'ccperf_endorsement',
             help: 'Endorsement latency',
-            labelNames: ['ccperf']
+            labelNames: ['ccperf'],
+            registers: [this.registry]
         });
         this.histgramSendTransaction = new prom.Histogram({
             name: 'ccperf_sendtransaction',
             help: 'SendTransaction latency',
-            labelNames: ['ccperf']
+            labelNames: ['ccperf'],
+            registers: [this.registry]
         });
         this.digestCommits = null;
     }
