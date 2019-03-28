@@ -806,6 +806,8 @@ class DefaultChaincodeTxPlugin {
 
 class Worker {
     constructor(config) {
+        this.workerID = cluster.worker.id;
+        this.index = 1;
         this.config = config;
 
         let plugin;
