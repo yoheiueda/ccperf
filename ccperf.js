@@ -13,6 +13,7 @@ const request = require('request');
 const WebSocket = require('ws');
 const glob = require('glob');
 const prom = require('prom-client');
+const TDigest = require('tdigest').TDigest;
 
 const aggregatorRegistry = new prom.AggregatorRegistry();
 
@@ -113,6 +114,7 @@ function doRequest(options) {
             if (!error && res.statusCode < 300) {
                 resolve(body);
             } else {
+                console.error(body);
                 reject(error);
             }
         });
@@ -167,6 +169,16 @@ class LocalDriver {
             labelNames: ['ccperf', 'type', 'tx_validation_code'],
             registers: [this.registry]
         });
+        this.histgramE2E = new prom.Histogram({
+            name: 'ccperf_e2e',
+            help: 'E2E latency',
+            labelNames: ['ccperf', 'type', 'tx_validation_code'],
+            registers: [this.registry]
+        });
+        this.quantileEndorsement = new TDigest();
+        this.quantileSendTransaction = new TDigest();
+        this.quantileCommit = new TDigest();
+        this.quantileE2E = new TDigest();
     }
 
     daemon(ws) {
@@ -299,6 +311,12 @@ class LocalDriver {
 
     async collectMetrics() {
         const commitMetricString = this.registry.getSingleMetricAsString('ccperf_commit');
+        const quantiles = {
+            'endorsement': this.quantileEndorsement.toArray(),
+            'sendtransaction': this.quantileSendTransaction.toArray(),
+            'commit': this.quantileCommit.toArray(),
+            'e2e': this.quantileE2E.toArray()
+        };
 
         return new Promise((resolve, reject) => {
             aggregatorRegistry.clusterMetrics((err, metricsStr) => {
@@ -306,7 +324,10 @@ class LocalDriver {
                 if (err) {
                     reject(err);
                 } else {
-                    resolve(decodeMetricsString(metricsStr));
+                    resolve({
+                        promMetrics: decodeMetricsString(metricsStr),
+                        quantiles: quantiles
+                    });
                 }
             });
         });
@@ -335,13 +356,20 @@ class LocalDriver {
             const tx = this.txTable.get(txid);
             if (tx !== undefined) {
                 this.txTable.delete(txid);
-                const msLatency = now - tx.timestamp;
+                const commitLatency = (now - tx.t3) / 1000;
+                const e2eLatency = (now - tx.t1) / 1000;
                 const labels = {
                     "ccperf": "test",
                     "type": commit.type,
                     "tx_validation_code": commit.tx_validation_code
                 }
-                this.histgramCommit.observe(labels, msLatency / 1000);
+                this.histgramCommit.observe(labels, commitLatency);
+                this.histgramE2E.observe(labels, e2eLatency);
+
+                this.quantileEndorsement.push((tx.t2 - tx.t1) / 1000);
+                this.quantileSendTransaction.push((tx.t3 - tx.t2) / 1000);
+                this.quantileCommit.push(commitLatency);
+                this.quantileE2E.push(e2eLatency);
             }
         }
     }
@@ -589,9 +617,17 @@ class Master {
     aggregateMetrics(metricsArray) {
         const metricsTable = {};
 
+        const tdigestTable = {
+            endorsement: new TDigest(),
+            sendtransaction: new TDigest(),
+            commit: new TDigest(),
+            e2e: new TDigest()
+        };
+
         for (const metrics of metricsArray) {
-            for (const name of Object.keys(metrics)) {
-                const metric = metrics[name];
+            // Prometheus Histograms
+            for (const name of Object.keys(metrics.promMetrics)) {
+                const metric = metrics.promMetrics[name];
                 let metricObj = metricsTable[name];
                 if (metricObj === undefined) {
                     metricObj = {
@@ -609,6 +645,29 @@ class Master {
                     metricObj.values[fullname] = oldValue + metric.values[fullname];
                 }
             }
+            // TDigest quantiles
+            for (const name of Object.keys(metrics.quantiles)) {
+                const quantile = metrics.quantiles[name];
+                const tdigest = tdigestTable[name];
+                tdigest.push_centroid(quantile);
+            }
+        }
+
+        for (const key of Object.keys(tdigestTable)) {
+            const name = 'ccperf_' + key + '_quantile';
+            const tdigest = tdigestTable[key];
+            const metricObj = {
+                help: key + " latency quantile",
+                type: "gauge",
+                values: {}
+            }
+            for (const p of [0.5, 0.9, 0.95, 0.99]) {
+                const percentile = tdigest.percentile(p);
+                if (percentile !== undefined) {
+                    metricObj.values[name + '{le="' + String(p) + '"}'] = percentile;
+                }
+            }
+            metricsTable[name] = metricObj;
         }
 
         return metricsTable;
@@ -953,7 +1012,9 @@ class Worker {
             type: 'tx',
             tx: {
                 id: tx_id.getTransactionID(),
-                timestamp: t3
+                t1: t1,
+                t2: t2,
+                t3: t3
             }
         });
 
