@@ -715,22 +715,33 @@ class Master {
     }
 }
 
-const handlerTable = {
-    'putstate': {
-        'chaincodeId': 'ccperf',
-        'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
-    },
-    'getstate': {
-        'chaincodeId': 'ccperf',
-        'genArgs': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)]
-    },
-    'mix': {
-        'chaincodeId': 'ccperf',
-        'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
-    },
-    'json': {
-        'chaincodeId': 'ccperf',
-        'genArgs': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)]
+class DefaultChaincodeTxPlugin {
+    constructor() {
+        this._chaincodeId = 'ccperf';
+        this._genArgsTable = {
+            'putstate': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
+            'getstate': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
+            'mix': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
+            'json': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
+        }
+    }
+
+    getChaincodeId() {
+        return this._chaincodeId;
+    }
+
+    getTxTypes() {
+        return Object.keys(this._genArgsTable);
+    }
+
+    getTxHandler(txType) {
+        return {
+            chaincodeId: this.getChaincodeId(),
+            isQuery: false,
+            fcn: txType,
+            genArgs: this._genArgsTable[txType],
+            genTransientMap: undefined
+        };
     }
 }
 
@@ -738,16 +749,19 @@ class Worker {
     constructor(config) {
         this.config = config;
 
-        if (config.txHandler) {
-            const txHandler = eval(config.txHandler);
-            const plugin = new txHandler();
-            const txName = plugin.getName();
-            this.handlerTable[txName] = plugin.getHandler();
+        let plugin;
+        if (config.txPluginStr) {
+            const txPluginClass = eval(config.txPluginStr);
+            plugin = new txPluginClass();
+        } else {
+            plugin = new DefaultChaincodeTxPlugin();
         }
 
-        this.chaincodeId = handlerTable[config.type].chaincodeId;
-        this.genArgs = handlerTable[config.type].genArgs;
-        this.genTransientMap = handlerTable[config.type].genTransientMap;
+        const handler = plugin.getTxHandler(config.txType);
+        this.chaincodeId = handler.chaincodeId;
+        this.fcn = handler.fcn;
+        this.genArgs = handler.genArgs;
+        this.genTransientMap = handler.genTransientMap;
 
         if (config.logdir) {
             const requestsLogPath = config.logdir + '/requests-' + cluster.worker.id + '.json';
@@ -834,10 +848,6 @@ class Worker {
             await sleep(wait);
         }
 
-        //const timeout = setInterval(execute, interval, info);
-        //await sleep(duration);
-        //clearInterval(timeout);
-
         const end = startTime + config.rampup + config.duration + config.rampdown;
         let behind = 0;
         while (true) {
@@ -892,7 +902,7 @@ class Worker {
         const request = {
             targets: this.peers,
             chaincodeId: this.chaincodeId,
-            fcn: this.config.type,
+            fcn: this.fcn,
             args: this.genArgs(this),
             txId: tx_id
         };
@@ -1012,9 +1022,9 @@ function run(cmd) {
         remotes = cmd.remote.split(',');
     }
 
-    let txHandlerStr;
-    if (cmd.txHandler !== undefined) {
-        txHandlerStr = loadFile(cmd.TxHandler);
+    let txPluginStr;
+    if (cmd.txPlugin !== undefined) {
+        txPluginStr = loadFile(cmd.txPlugin);
     }
 
     const config = {
@@ -1028,11 +1038,11 @@ function run(cmd) {
         peerSelection: cmd.peerSelection,
         ordererSelection: cmd.ordererSelection,
         committingPeerName: cmd.committingPeer,
-        type: cmd.type,
+        txType: cmd.type,
         num: cmd.num === undefined ? 1 : Number(cmd.num),
         size: cmd.size === undefined ? 1 : Number(cmd.size),
         population: cmd.population === undefined ? undefined : Number(cmd.population),
-        txHandler: txHandlerStr,
+        txPluginStr: txPluginStr,
         clientKeys: cmd.clientKeys,
         grafana: cmd.grafana,
         prometheus: cmd.prometheusPushgateway,
@@ -1050,8 +1060,6 @@ function run(cmd) {
         process.exit(1);
     });
 }
-
-
 
 function daemon(cmd) {
     if (cmd.port === undefined) {
@@ -1109,7 +1117,7 @@ function main() {
         .option('--num [number]', "Number of operations per transaction")
         .option('--size [bytes]', "Payload size of a PutState call")
         .option('--population [number]', "Number of prepopulated key-values")
-        .option('--tx-plugin', "JavaScript file that defines transaction handler")
+        .option('--tx-plugin [plugin]', "JavaScript file that defines transaction handler")
         .option('--committing-peer [name]', "Peer name whose commit events are monitored ")
         .option('--endorsing-orgs [org1,org2]', 'Comma-separated list of organizations')
         .option('--orderer-selection [type]', "Orderer selection method: first or balance. Default is first")
