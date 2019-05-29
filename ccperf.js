@@ -5,7 +5,6 @@ const program = require('commander');
 const fs = require('fs');
 const path = require('path');
 const sdk = require('fabric-client');
-const sdkutil = require('fabric-client/lib/utils.js');
 const util = require('util');
 const sprintf = require('sprintf-js').sprintf;
 const yaml = require('js-yaml');
@@ -69,6 +68,8 @@ class MemoryKeyValueStore {
         self._store = new Map();
         return Promise.resolve(self);
     }
+    initialize() {
+    }
 
     getValue(name) {
         const value = Promise.resolve(this._store.get(name));
@@ -88,8 +89,7 @@ async function getClient(profile, orgName) {
     const cryptoKeyStore = sdk.newCryptoKeyStore(MemoryKeyValueStore, {})
     cryptoSuite.setCryptoKeyStore(cryptoKeyStore);
 
-    const client = sdk.loadFromConfig(profile);
-
+    const client = await sdk.loadFromConfig(profile);
     client.setCryptoSuite(cryptoSuite);
     const newStore = await new MemoryKeyValueStore();
     client.setStateStore(newStore);
@@ -123,7 +123,6 @@ function doRequest(options) {
 
 async function populate(config, channel) {
     const client = await getClient(config.profile, config.orgName)
-    const channel = client.getChannel(config.channelID);
 
     const peer_name = channel.getPeers()[0].getName();
     const eventhub = channel.getChannelEventHub(peer_name);
@@ -703,7 +702,7 @@ class Master {
         this.channel = this.client.getChannel(config.channelID);
 
         if (config.population) {
-            await populate(config);
+            await populate(config, this.channel);
         }
         if (config.committingPeerName) {
             this.setupEventHub();

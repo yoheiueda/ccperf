@@ -1,7 +1,7 @@
 - targets:
   {%- for org in orgs %}
   {%- for peer in org.peers %}
-    - {{ peer.name }}.{{ org.domain }}:{{ peer.ports.exporter }}
+    - {{ peer.name }}.{{ org.domain }}:{{ peer.ports.exporter or 8080 }}
   {%- endfor %}
   {%- endfor %}
   labels:
@@ -9,7 +9,7 @@
 
 - targets:
   {%- for orderer in ordererorg.orderers %}
-    - {{ orderer.name }}.{{ ordererorg.domain }}:{{ orderer.ports.exporter }}
+    - {{ orderer.name }}.{{ ordererorg.domain }}:{{ orderer.ports.exporter or 8080 }}
   {%- endfor %}
   labels:
     service: orderer

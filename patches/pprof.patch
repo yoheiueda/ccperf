@@ -1,8 +1,37 @@
+commit 8de706de3434987430f5418f02dae48093f4aaea
+Author: Yohei Ueda <yohei@jp.ibm.com>
+Date:   Fri May 24 18:08:37 2019 +0900
+
+    Support pprof block profiles
+    
+    Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
+
+diff --git a/internal/peer/node/start.go b/internal/peer/node/start.go
+index 0cf49df9d..c19ae7cb3 100644
+--- a/internal/peer/node/start.go
++++ b/internal/peer/node/start.go
+@@ -14,6 +14,7 @@ import (
+ 	"os/signal"
+ 	"path/filepath"
+ 	"syscall"
++	"runtime"
+ 	"time"
+ 
+ 	docker "github.com/fsouza/go-dockerclient"
+@@ -539,6 +540,8 @@ func serve(args []string) error {
+ 
+ 	// Start profiling http endpoint if enabled
+ 	if profileEnabled {
++		runtime.SetBlockProfileRate(viper.GetInt("peer.profile.blockProfileRate"))
++		runtime.SetMutexProfileFraction(viper.GetInt("peer.profile.mutexProfileFraction"))
+ 		go func() {
+ 			logger.Infof("Starting profiling server with listenAddress = %s", profileListenAddress)
+ 			if profileErr := http.ListenAndServe(profileListenAddress, nil); profileErr != nil {
 diff --git a/orderer/common/localconfig/config.go b/orderer/common/localconfig/config.go
-index eee2c2766..baa0bb8a3 100644
+index e33347842..cf5af7743 100644
 --- a/orderer/common/localconfig/config.go
 +++ b/orderer/common/localconfig/config.go
-@@ -100,8 +100,10 @@ type Authentication struct {
+@@ -108,8 +108,10 @@ type Authentication struct {
  
  // Profile contains configuration for Go pprof profiling.
  type Profile struct {
@@ -15,7 +44,7 @@ index eee2c2766..baa0bb8a3 100644
  }
  
  // FileLedger contains configuration for the file-based ledger.
-@@ -210,8 +212,10 @@ var Defaults = TopLevel{
+@@ -218,8 +220,10 @@ var Defaults = TopLevel{
  		SystemChannel:  "test-system-channel-name",
  		GenesisFile:    "genesisblock",
  		Profile: Profile{
@@ -26,10 +55,10 @@ index eee2c2766..baa0bb8a3 100644
 +			BlockProfileRate:     0,
 +			MutexProfileFraction: 0,
  		},
- 		LocalMSPDir: "msp",
- 		LocalMSPID:  "SampleOrg",
+ 		Cluster: Cluster{
+ 			ReplicationMaxRetries:                12,
 diff --git a/orderer/common/server/main.go b/orderer/common/server/main.go
-index b9df1122c..51f10ac06 100644
+index 62f538de1..f594a93b3 100644
 --- a/orderer/common/server/main.go
 +++ b/orderer/common/server/main.go
 @@ -16,6 +16,7 @@ import (
@@ -37,10 +66,10 @@ index b9df1122c..51f10ac06 100644
  	"os"
  	"os/signal"
 +	"runtime"
+ 	"sync"
  	"syscall"
  	"time"
- 
-@@ -169,6 +170,9 @@ func initializeLogging() {
+@@ -248,6 +249,9 @@ func initializeLogging() {
  // Start the profiling service if enabled.
  func initializeProfilingService(conf *localconfig.TopLevel) {
  	if conf.General.Profile.Enabled {
@@ -50,32 +79,11 @@ index b9df1122c..51f10ac06 100644
  		go func() {
  			logger.Info("Starting Go pprof profiling service on:", conf.General.Profile.Address)
  			// The ListenAndServe() call does not return unless an error occurs.
-diff --git a/peer/node/start.go b/peer/node/start.go
-index 87192f467..c4ba558e6 100644
---- a/peer/node/start.go
-+++ b/peer/node/start.go
-@@ -12,6 +12,7 @@ import (
- 	"net/http"
- 	"os"
- 	"os/signal"
-+	"runtime"
- 	"syscall"
- 	"time"
- 
-@@ -386,6 +387,8 @@ func serve(args []string) error {
- 
- 	// Start profiling http endpoint if enabled
- 	if profileEnabled {
-+		runtime.SetBlockProfileRate(viper.GetInt("peer.profile.blockProfileRate"))
-+		runtime.SetMutexProfileFraction(viper.GetInt("peer.profile.mutexProfileFraction"))
- 		go func() {
- 			logger.Infof("Starting profiling server with listenAddress = %s", profileListenAddress)
- 			if profileErr := http.ListenAndServe(profileListenAddress, nil); profileErr != nil {
 diff --git a/sampleconfig/core.yaml b/sampleconfig/core.yaml
-index 32666c757..b99693e6b 100644
+index 60785ebcb..2f20cbeb2 100644
 --- a/sampleconfig/core.yaml
 +++ b/sampleconfig/core.yaml
-@@ -307,6 +307,8 @@ peer:
+@@ -337,6 +337,8 @@ peer:
      profile:
          enabled:     false
          listenAddress: 0.0.0.0:6060
@@ -85,10 +93,10 @@ index 32666c757..b99693e6b 100644
      # The admin service is used for administrative operations such as
      # control over logger levels, etc.
 diff --git a/sampleconfig/orderer.yaml b/sampleconfig/orderer.yaml
-index e9abd1fe7..02ddf6071 100644
+index 36588286b..6cf8323dd 100644
 --- a/sampleconfig/orderer.yaml
 +++ b/sampleconfig/orderer.yaml
-@@ -114,6 +114,8 @@ General:
+@@ -112,6 +112,8 @@ General:
      Profile:
          Enabled: false
          Address: 0.0.0.0:6060

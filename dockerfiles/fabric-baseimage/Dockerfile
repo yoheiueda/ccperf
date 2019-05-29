@@ -1,7 +1,7 @@
-ARG BASE_VERSION="0.4.14"
+ARG BASE_VERSION="0.4.15"
 
 FROM ubuntu AS go
-ARG GO_VERSION="1.11.5"
+ARG GO_VERSION="1.12.5"
 ADD go-wakup-profile-go1.11.patch /
 WORKDIR /usr/local
 RUN apt-get update -y && apt-get install -y build-essential golang git

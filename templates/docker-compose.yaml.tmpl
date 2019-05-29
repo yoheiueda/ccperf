@@ -37,8 +37,12 @@ services:
       {% endif %}
     working_dir: /opt/gopath/src/github.com/hyperledger/fabric
     command: orderer
+    {%- if orderer.volume is defined and orderer.volume == "tmpfs" %}
+    tmpfs:
+      - /var/hyperledger/production
+    {%- endif %}
     volumes:
-      {%- if orderer.volume %}
+      {%- if orderer.volume is defined and orderer.volume != "tmpfs" %}
       - {{ orderer.volume }}:/var/hyperledger/production
       {%- endif %}
       - ./genesis.block:/var/hyperledger/orderer/orderer.genesis.block
@@ -88,7 +92,7 @@ services:
       - CORE_PEER_GOSSIP_USELEADERELECTION={% if org.useLeaderElection %}true{% else %}false{% endif %}
       {%- for bootstrap in org.peers %}
       {%- if bootstrap.name == peer.bootstrap %}
-      - CORE_PEER_GOSSIP_BOOTSTRAP={{ bootstrap.name }}.{{ org.name }}.{{ org.domain }}:{{ bootstrap.ports.requests }}
+      - CORE_PEER_GOSSIP_BOOTSTRAP={{ bootstrap.name }}.{{ org.domain }}:{{ bootstrap.ports.requests }}
       {% if not org.useLeaderElection %}- CORE_PEER_GOSSIP_ORGLEADER={% if bootstrap.name == peer.name %}true{% else %}false{% endif %}{% endif %}
       {%- endif %}
       {%- endfor %}
@@ -102,10 +106,15 @@ services:
       - CORE_PEER_PROFILE_ENABLED=true
       - CORE_PEER_PROFILE_BLOCKPROFILERATE=1000
       - CORE_PEER_PROFILE_MUTEXPROFILEFRACTION=1000
+      - CORE_LEDGER_STATE_TXMANAGER=${TXMANAGER}
     working_dir: /opt/gopath/src/github.com/hyperledger/fabric/peer
     command: peer node start
+    {%- if peer.volume is defined and peer.volume == "tmpfs" %}
+    tmpfs:
+      - /var/hyperledger/production
+    {%- endif %}
     volumes:
-      {%- if peer.volume %}
+      {%- if peer.volume is defined and peer.volume != "tmpfs" %}
       - {{ peer.volume }}:/var/hyperledger/production
       {%- endif %}
       - /var/run/:/host/var/run/
@@ -226,9 +235,12 @@ services:
     image: prom/prometheus
     command:
       - '--config.file=/config/prometheus.yml'
-      #- '--storage.tsdb.path=/data'
+      - '--storage.tsdb.path=/data'
     volumes:
       - ./prometheus:/config
+    {%- if prometheus.volume %}
+      - {{  prometheus.volume }}:/data
+    {% endif %}
     ports:
       - {{ prometheus.port }}:9090
     networks:
