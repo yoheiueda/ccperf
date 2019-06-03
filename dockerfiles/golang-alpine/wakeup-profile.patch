@@ -1,0 +1,709 @@
+commit d88b29badd2d32b1ddf695b998f00661a91c38bd
+Author: Yohei Ueda <yohei@jp.ibm.com>
+Date:   Thu May 30 16:28:31 2019 +0900
+
+    Wakeup profile
+    
+    Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
+    Change-Id: I3892897f41ed15bb4648232f4d5766994240a031
+
+diff --git a/api/except.txt b/api/except.txt
+index 637be18135..868574ea78 100644
+--- a/api/except.txt
++++ b/api/except.txt
+@@ -457,3 +457,5 @@ pkg syscall (freebsd-arm-cgo), type Stat_t struct, Nlink uint16
+ pkg syscall (freebsd-arm-cgo), type Stat_t struct, Rdev uint32
+ pkg syscall (freebsd-arm-cgo), type Statfs_t struct, Mntfromname [88]int8
+ pkg syscall (freebsd-arm-cgo), type Statfs_t struct, Mntonname [88]int8
++pkg runtime, type MemProfileRecord struct, Stack0 [32]uintptr
++pkg runtime, type StackRecord struct, Stack0 [32]uintptr
+\ No newline at end of file
+diff --git a/api/go1-wakeup.txt b/api/go1-wakeup.txt
+new file mode 100644
+index 0000000000..2d85d6ce7d
+--- /dev/null
++++ b/api/go1-wakeup.txt
+@@ -0,0 +1,13 @@
++pkg runtime, func SetWakeupProfileFraction(int) int
++pkg runtime, func WakeupProfile([]WakeupProfileRecord) (int, bool)
++pkg runtime, method (*StackRecordWithCreator) Stack() []uintptr
++pkg runtime, type MemProfileRecord struct, Stack0 [64]uintptr
++pkg runtime, type StackRecord struct, Stack0 [64]uintptr
++pkg runtime, type StackRecordWithCreator struct
++pkg runtime, type StackRecordWithCreator struct, Creator uintptr
++pkg runtime, type StackRecordWithCreator struct, embedded StackRecord
++pkg runtime, type WakeupProfileRecord struct
++pkg runtime, type WakeupProfileRecord struct, Count int64
++pkg runtime, type WakeupProfileRecord struct, Cycles int64
++pkg runtime, type WakeupProfileRecord struct, Notifier StackRecordWithCreator
++pkg runtime, type WakeupProfileRecord struct, Waiter StackRecordWithCreator
+diff --git a/src/net/http/pprof/pprof.go b/src/net/http/pprof/pprof.go
+index 35b3285a08..0ec25dd183 100644
+--- a/src/net/http/pprof/pprof.go
++++ b/src/net/http/pprof/pprof.go
+@@ -242,6 +242,10 @@ func (name handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		w.Header().Set("Content-Type", "application/octet-stream")
+ 		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
+ 	}
++	rate, _ := strconv.Atoi(r.FormValue("rate"))
++	if name == "wakeup" && rate > 0 {
++		runtime.SetWakeupProfileFraction(rate)
++	}
+ 	p.WriteTo(w, debug)
+ }
+ 
+@@ -255,6 +259,7 @@ var profileDescriptions = map[string]string{
+ 	"profile":      "CPU profile. You can specify the duration in the seconds GET parameter. After you get the profile file, use the go tool pprof command to investigate the profile.",
+ 	"threadcreate": "Stack traces that led to the creation of new OS threads",
+ 	"trace":        "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
++	"wakeup":       "Stack traces that led to wake-up events",
+ }
+ 
+ // Index responds with the pprof-formatted profile named by the request.
+diff --git a/src/runtime/chan.go b/src/runtime/chan.go
+index 8662f00e13..89733d043d 100644
+--- a/src/runtime/chan.go
++++ b/src/runtime/chan.go
+@@ -175,10 +175,13 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+ 		return false
+ 	}
+ 
+-	var t0 int64
++	var t0, blocktime int64
+ 	if blockprofilerate > 0 {
+ 		t0 = cputicks()
+ 	}
++	if wakeupprofilerate > 0 {
++		blocktime = cputicks()
++	}
+ 
+ 	lock(&c.lock)
+ 
+@@ -223,6 +226,10 @@ func chansend(c *hchan, ep unsafe.Pointer, block bool, callerpc uintptr) bool {
+ 	if t0 != 0 {
+ 		mysg.releasetime = -1
+ 	}
++	mysg.blocktime = 0
++	if blocktime != 0 {
++		mysg.blocktime = blocktime
++	}
+ 	// No stack splits between assigning elem and enqueuing mysg
+ 	// on gp.waiting where copystack can find it.
+ 	mysg.elem = ep
+@@ -296,6 +303,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+ 	if sg.releasetime != 0 {
+ 		sg.releasetime = cputicks()
+ 	}
++	wakeupevent(sg.blocktime, gp, 2)
+ 	goready(gp, skip+1)
+ }
+ 
+@@ -371,6 +379,7 @@ func closechan(c *hchan) {
+ 			raceacquireg(gp, c.raceaddr())
+ 		}
+ 		glist.push(gp)
++		wakeupevent(sg.blocktime, gp, 2)
+ 	}
+ 
+ 	// release all writers (they will panic)
+@@ -389,6 +398,7 @@ func closechan(c *hchan) {
+ 			raceacquireg(gp, c.raceaddr())
+ 		}
+ 		glist.push(gp)
++		wakeupevent(sg.blocktime, gp, 2)
+ 	}
+ 	unlock(&c.lock)
+ 
+@@ -456,6 +466,10 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
+ 	if blockprofilerate > 0 {
+ 		t0 = cputicks()
+ 	}
++	var blocktime int64
++	if wakeupprofilerate > 0 {
++		blocktime = cputicks()
++	}
+ 
+ 	lock(&c.lock)
+ 
+@@ -511,6 +525,10 @@ func chanrecv(c *hchan, ep unsafe.Pointer, block bool) (selected, received bool)
+ 	if t0 != 0 {
+ 		mysg.releasetime = -1
+ 	}
++	mysg.blocktime = 0
++	if blocktime != 0 {
++		mysg.blocktime = blocktime
++	}
+ 	// No stack splits between assigning elem and enqueuing mysg
+ 	// on gp.waiting where copystack can find it.
+ 	mysg.elem = ep
+@@ -591,6 +609,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+ 	if sg.releasetime != 0 {
+ 		sg.releasetime = cputicks()
+ 	}
++	wakeupevent(sg.blocktime, gp, 2)
+ 	goready(gp, skip+1)
+ }
+ 
+diff --git a/src/runtime/mprof.go b/src/runtime/mprof.go
+index 2bd41b650f..c473df8c69 100644
+--- a/src/runtime/mprof.go
++++ b/src/runtime/mprof.go
+@@ -23,12 +23,13 @@ const (
+ 	memProfile bucketType = 1 + iota
+ 	blockProfile
+ 	mutexProfile
++	wakeupProfile
+ 
+ 	// size of bucket hash table
+ 	buckHashSize = 179999
+ 
+ 	// max depth of stack to record in bucket
+-	maxStack = 32
++	maxStack = 130
+ )
+ 
+ type bucketType int
+@@ -137,10 +138,18 @@ type blockRecord struct {
+ 	cycles int64
+ }
+ 
++// A wakeupRecord is the bucket data for a bucket of type wakeupProfile,
++// which is used in wake-up profiles.
++type wakeupRecord struct {
++	blockRecord
++	nstkNotifier, nstkWaiter int
++}
++
+ var (
+ 	mbuckets  *bucket // memory profile buckets
+ 	bbuckets  *bucket // blocking profile buckets
+ 	xbuckets  *bucket // mutex profile buckets
++	wbuckets  *bucket // wakeup profile buckets
+ 	buckhash  *[179999]*bucket
+ 	bucketmem uintptr
+ 
+@@ -154,6 +163,11 @@ var (
+ 		// has been flushed to the active profile.
+ 		flushed bool
+ 	}
++
++	wProf struct {
++		// Number of wakeup events. Updated atomically.
++		count uint64
++	}
+ )
+ 
+ const mProfCycleWrap = uint32(len(memRecord{}.future)) * (2 << 24)
+@@ -168,6 +182,8 @@ func newBucket(typ bucketType, nstk int) *bucket {
+ 		size += unsafe.Sizeof(memRecord{})
+ 	case blockProfile, mutexProfile:
+ 		size += unsafe.Sizeof(blockRecord{})
++	case wakeupProfile:
++		size += unsafe.Sizeof(wakeupRecord{})
+ 	}
+ 
+ 	b := (*bucket)(persistentalloc(size, 0, &memstats.buckhash_sys))
+@@ -201,6 +217,15 @@ func (b *bucket) bp() *blockRecord {
+ 	return (*blockRecord)(data)
+ }
+ 
++// wp returns the wakeupRecord associated with the wakeupProfile bucket b.
++func (b *bucket) wp() *wakeupRecord {
++	if b.typ != wakeupProfile {
++		throw("bad use of bucket.bp")
++	}
++	data := add(unsafe.Pointer(b), unsafe.Sizeof(*b)+b.nstk*unsafe.Sizeof(uintptr(0)))
++	return (*wakeupRecord)(data)
++}
++
+ // Return the bucket for stk[0:nstk], allocating new bucket if needed.
+ func stkbucket(typ bucketType, size uintptr, stk []uintptr, alloc bool) *bucket {
+ 	if buckhash == nil {
+@@ -249,6 +274,9 @@ func stkbucket(typ bucketType, size uintptr, stk []uintptr, alloc bool) *bucket
+ 	} else if typ == mutexProfile {
+ 		b.allnext = xbuckets
+ 		xbuckets = b
++	} else if typ == wakeupProfile {
++		b.allnext = wbuckets
++		wbuckets = b
+ 	} else {
+ 		b.allnext = bbuckets
+ 		bbuckets = b
+@@ -458,11 +486,73 @@ func mutexevent(cycles int64, skip int) {
+ 	}
+ }
+ 
++var wakeupprofilerate uint64
++
++// SetWakeupProfileFraction controls the fraction of wake-up events
++// that are reported in the wakeup profile. On average 1/rate events are
++// reported. The previous rate is returned.
++//
++// To turn off profiling entirely, pass rate 0.
++// To just read the current rate, pass rate -1.
++// (For n>1 the details of sampling may change.)
++func SetWakeupProfileFraction(rate int) int {
++	if rate < 0 {
++		return int(wakeupprofilerate)
++	}
++	old := wakeupprofilerate
++	atomic.Store64(&wakeupprofilerate, uint64(rate))
++	return int(old)
++}
++
++func wakeupevent(blocktime int64, gpWaiter *g, skip int) {
++	rate := uint64(atomic.Load64(&wakeupprofilerate))
++	if rate == 0 {
++		return
++	}
++	count := atomic.Xadd64(&wProf.count, 1)
++	if count%rate == 0 {
++		var cycles int64
++		if blocktime > 0 {
++			cycles = cputicks() - blocktime
++		}
++		savewakeupevent(cycles, gpWaiter, skip)
++	}
++}
++
++func savewakeupevent(cycles int64, gpWaiter *g, skip int) {
++	var nstkNotifier, nstkWaiter int
++	var stkNotifier, stkWaiter [maxStack]uintptr
++	var crtNotifier, crtWaiter uintptr
++	var stkAll []uintptr
++	gpNotifier := getg()
++	if gpNotifier.m.curg == nil || gpNotifier.m.curg == gpNotifier {
++		nstkNotifier = callers(skip, stkNotifier[:])
++		crtNotifier = getg().gopc
++	} else {
++		nstkNotifier = gcallers(gpNotifier.m.curg, skip, stkNotifier[:])
++		crtNotifier = gpNotifier.m.curg.gopc
++	}
++	nstkWaiter = gcallers(gpWaiter, 0, stkWaiter[:])
++	crtWaiter = gpWaiter.gopc
++	stkAll = append(stkAll, stkNotifier[:nstkNotifier]...)
++	stkAll = append(stkAll, crtNotifier)
++	stkAll = append(stkAll, stkWaiter[:nstkWaiter]...)
++	stkAll = append(stkAll, crtWaiter)
++	lock(&proflock)
++	b := stkbucket(wakeupProfile, 0, stkAll[:nstkNotifier+nstkWaiter+2], true)
++	wp := b.wp()
++	wp.cycles += cycles
++	wp.count++
++	wp.nstkNotifier = nstkNotifier
++	wp.nstkWaiter = nstkWaiter
++	unlock(&proflock)
++}
++
+ // Go interface to profile data.
+ 
+ // A StackRecord describes a single execution stack.
+ type StackRecord struct {
+-	Stack0 [32]uintptr // stack trace for this record; ends at first 0 entry
++	Stack0 [64]uintptr // stack trace for this record; ends at first 0 entry
+ }
+ 
+ // Stack returns the stack trace associated with the record,
+@@ -497,7 +587,7 @@ var MemProfileRate int = 512 * 1024
+ type MemProfileRecord struct {
+ 	AllocBytes, FreeBytes     int64       // number of bytes allocated, freed
+ 	AllocObjects, FreeObjects int64       // number of objects allocated, freed
+-	Stack0                    [32]uintptr // stack trace for this record; ends at first 0 entry
++	Stack0                    [64]uintptr // stack trace for this record; ends at first 0 entry
+ }
+ 
+ // InUseBytes returns the number of bytes in use (AllocBytes - FreeBytes).
+@@ -811,6 +901,62 @@ func Stack(buf []byte, all bool) int {
+ 	return n
+ }
+ 
++// WakeupProfileRecord describes call sequences of a notifier and a waiter
++// goroutines, which the waiter has been blocked and the notifier wakes up
++// the waiter.
++type WakeupProfileRecord struct {
++	Count    int64
++	Cycles   int64
++	Waiter   StackRecordWithCreator
++	Notifier StackRecordWithCreator
++}
++
++// StackRecordWithCreator is a stack trace with an additional creation site
++// of the goroutine.
++type StackRecordWithCreator struct {
++	StackRecord
++	Creator uintptr
++}
++
++// WakeupProfile returns n, the number of records in the active wakeup profile.
++// If len(p) >= n, WakeupProfile copies the profile into p and returns n, true.
++// If len(p) < n, WakeupProfile does not change p and returns n, false.
++//
++// Most clients should use the runtime/pprof package instead
++// of calling WakeupProfile directly.
++func WakeupProfile(p []WakeupProfileRecord) (n int, ok bool) {
++	lock(&proflock)
++	for b := wbuckets; b != nil; b = b.allnext {
++		n++
++	}
++	if n <= len(p) {
++		ok = true
++		for b := wbuckets; b != nil; b = b.allnext {
++			wp := b.wp()
++			r := &p[0]
++			r.Count = int64(wp.count)
++			r.Cycles = wp.cycles
++			start := 0
++			i := copy(r.Notifier.Stack0[:], b.stk()[start:start+wp.nstkNotifier])
++			for ; i < len(r.Notifier.Stack0); i++ {
++				r.Notifier.Stack0[i] = 0
++			}
++			start += wp.nstkNotifier
++			r.Notifier.Creator = b.stk()[start]
++			start += 1
++			j := copy(r.Waiter.Stack0[:], b.stk()[start:start+wp.nstkWaiter])
++			for ; j < len(r.Waiter.Stack0); j++ {
++				r.Waiter.Stack0[j] = 0
++			}
++			start += wp.nstkWaiter
++			r.Waiter.Creator = b.stk()[start]
++			p = p[1:]
++		}
++	}
++	unlock(&proflock)
++	return
++}
++
+ // Tracing of alloc/free/gc.
+ 
+ var tracelock mutex
+diff --git a/src/runtime/netpoll.go b/src/runtime/netpoll.go
+index 71ca993cc0..68531752e9 100644
+--- a/src/runtime/netpoll.go
++++ b/src/runtime/netpoll.go
+@@ -356,6 +356,7 @@ func netpollblockcommit(gp *g, gpp unsafe.Pointer) bool {
+ 
+ func netpollgoready(gp *g, traceskip int) {
+ 	atomic.Xadd(&netpollWaiters, -1)
++	wakeupevent(0, gp, 2)
+ 	goready(gp, traceskip+1)
+ }
+ 
+diff --git a/src/runtime/pprof/pprof.go b/src/runtime/pprof/pprof.go
+index 74cdd15cfb..72a31f17a8 100644
+--- a/src/runtime/pprof/pprof.go
++++ b/src/runtime/pprof/pprof.go
+@@ -105,6 +105,7 @@ import (
+ //	threadcreate - stack traces that led to the creation of new OS threads
+ //	block        - stack traces that led to blocking on synchronization primitives
+ //	mutex        - stack traces of holders of contended mutexes
++//	wakeup       - stack traces of goroutines who wakes another goroutine up
+ //
+ // These predefined profiles maintain themselves and panic on an explicit
+ // Add or Remove method call.
+@@ -180,6 +181,12 @@ var mutexProfile = &Profile{
+ 	write: writeMutex,
+ }
+ 
++var wakeupProfile = &Profile{
++	name:  "wakeup",
++	count: countWakeup,
++	write: writeWakeup,
++}
++
+ func lockProfiles() {
+ 	profiles.mu.Lock()
+ 	if profiles.m == nil {
+@@ -191,6 +198,7 @@ func lockProfiles() {
+ 			"allocs":       allocsProfile,
+ 			"block":        blockProfile,
+ 			"mutex":        mutexProfile,
++			"wakeup":       wakeupProfile,
+ 		}
+ 	}
+ }
+@@ -436,7 +444,7 @@ func printCountProfile(w io.Writer, debug int, name string, p countProfile) erro
+ 		fmt.Fprintf(tw, "%s profile: total %d\n", name, p.Len())
+ 		for _, k := range keys {
+ 			fmt.Fprintf(tw, "%d %s\n", count[k], k)
+-			printStackRecord(tw, p.Stack(index[k]), false)
++			printStackRecordLn(tw, p.Stack(index[k]), false)
+ 		}
+ 		return tw.Flush()
+ 	}
+@@ -484,6 +492,11 @@ func (x *keysByCount) Less(i, j int) bool {
+ 	return ki < kj
+ }
+ 
++func printStackRecordLn(w io.Writer, stk []uintptr, allFrames bool) {
++	printStackRecord(w, stk, allFrames)
++	fmt.Fprintf(w, "\n")
++}
++
+ // printStackRecord prints the function + source line information
+ // for a single stack trace.
+ func printStackRecord(w io.Writer, stk []uintptr, allFrames bool) {
+@@ -511,7 +524,6 @@ func printStackRecord(w io.Writer, stk []uintptr, allFrames bool) {
+ 		printStackRecord(w, stk, true)
+ 		return
+ 	}
+-	fmt.Fprintf(w, "\n")
+ }
+ 
+ // Interface to system profiles.
+@@ -605,7 +617,7 @@ func writeHeapInternal(w io.Writer, debug int, defaultSampleType string) error {
+ 			fmt.Fprintf(w, " %#x", pc)
+ 		}
+ 		fmt.Fprintf(w, "\n")
+-		printStackRecord(w, r.Stack(), false)
++		printStackRecordLn(w, r.Stack(), false)
+ 	}
+ 
+ 	// Print memstats information too.
+@@ -854,7 +866,7 @@ func writeBlock(w io.Writer, debug int) error {
+ 		}
+ 		fmt.Fprint(w, "\n")
+ 		if debug > 0 {
+-			printStackRecord(w, r.Stack(), true)
++			printStackRecordLn(w, r.Stack(), true)
+ 		}
+ 	}
+ 
+@@ -907,7 +919,7 @@ func writeMutex(w io.Writer, debug int) error {
+ 		}
+ 		fmt.Fprint(w, "\n")
+ 		if debug > 0 {
+-			printStackRecord(w, r.Stack(), true)
++			printStackRecordLn(w, r.Stack(), true)
+ 		}
+ 	}
+ 
+@@ -923,3 +935,81 @@ func scaleMutexProfile(cnt int64, ns float64) (int64, float64) {
+ }
+ 
+ func runtime_cyclesPerSecond() int64
++
++// countWakeup returns the number of records in the wakeup profile.
++func countWakeup() int {
++	n, _ := runtime.WakeupProfile(nil)
++	return n
++}
++
++// writeWakeup writes the current wakeup profile to w
++func writeWakeup(w io.Writer, debug int) error {
++	var p []runtime.WakeupProfileRecord
++	n, ok := runtime.WakeupProfile(nil)
++	for {
++		p = make([]runtime.WakeupProfileRecord, n+50)
++		n, ok = runtime.WakeupProfile(p)
++		if ok {
++			p = p[:n]
++			break
++		}
++	}
++
++	sort.Slice(p, func(i, j int) bool {
++		return p[i].Cycles > p[j].Cycles || (p[i].Cycles == p[j].Cycles && p[i].Count > p[j].Count)
++	})
++
++	b := bufio.NewWriter(w)
++	var tw *tabwriter.Writer
++	w = b
++	if debug > 0 {
++		tw = tabwriter.NewWriter(w, 1, 8, 1, '\t', 0)
++		w = tw
++	}
++	fmt.Fprintf(w, "---wakeup:\n")
++	fmt.Fprintf(w, "sampling period=%d\n", runtime.SetWakeupProfileFraction(-1))
++	for i := range p {
++		r := &p[i]
++		fmt.Fprintf(w, "%v %v @", r.Cycles, r.Count)
++		for _, pc := range r.Waiter.Stack() {
++			fmt.Fprintf(w, " %#x", pc)
++		}
++		if r.Waiter.Creator != 0 {
++			fmt.Fprintf(w, " %#x", r.Waiter.Creator)
++		}
++		for _, pc := range r.Notifier.Stack() {
++			fmt.Fprintf(w, " %#x", pc)
++		}
++		if r.Notifier.Creator != 0 {
++			fmt.Fprintf(w, " %#x", r.Notifier.Creator)
++		}
++		fmt.Fprint(w, "\n")
++		if debug > 0 {
++			fmt.Fprintf(w, "# Waiter\n")
++			printStackRecordWithCreator(w, r.Waiter)
++			fmt.Fprintf(w, "\n")
++			fmt.Fprintf(w, "# Notifier\n")
++			printStackRecordWithCreator(w, r.Notifier)
++			fmt.Fprintf(w, "\n")
++		}
++	}
++	if tw != nil {
++		tw.Flush()
++	}
++	return b.Flush()
++}
++
++func printStackRecordWithCreator(w io.Writer, stk runtime.StackRecordWithCreator) {
++	printStackRecord(w, stk.Stack(), true)
++	if stk.Creator == 0 {
++		return
++	}
++	frame, _ := runtime.CallersFrames([]uintptr{stk.Creator}).Next()
++	fmt.Fprintf(w, "# created by ")
++	name := frame.Function
++	if name == "" {
++		fmt.Fprintf(w, "\t%#x\n", frame.PC)
++	} else {
++		fmt.Fprintf(w, "\t%#x\t%s+%#x\t%s:%d\n", frame.PC, name, frame.PC-frame.Entry, frame.File, frame.Line)
++	}
++}
+diff --git a/src/runtime/pprof/protomem_test.go b/src/runtime/pprof/protomem_test.go
+index 471b1ae9c3..bfdd25a895 100644
+--- a/src/runtime/pprof/protomem_test.go
++++ b/src/runtime/pprof/protomem_test.go
+@@ -21,9 +21,9 @@ func TestConvertMemProfile(t *testing.T) {
+ 	a1, a2 := uintptr(addr1)+1, uintptr(addr2)+1
+ 	rate := int64(512 * 1024)
+ 	rec := []runtime.MemProfileRecord{
+-		{AllocBytes: 4096, FreeBytes: 1024, AllocObjects: 4, FreeObjects: 1, Stack0: [32]uintptr{a1, a2}},
+-		{AllocBytes: 512 * 1024, FreeBytes: 0, AllocObjects: 1, FreeObjects: 0, Stack0: [32]uintptr{a2 + 1, a2 + 2}},
+-		{AllocBytes: 512 * 1024, FreeBytes: 512 * 1024, AllocObjects: 1, FreeObjects: 1, Stack0: [32]uintptr{a1 + 1, a1 + 2, a2 + 3}},
++		{AllocBytes: 4096, FreeBytes: 1024, AllocObjects: 4, FreeObjects: 1, Stack0: [64]uintptr{a1, a2}},
++		{AllocBytes: 512 * 1024, FreeBytes: 0, AllocObjects: 1, FreeObjects: 0, Stack0: [64]uintptr{a2 + 1, a2 + 2}},
++		{AllocBytes: 512 * 1024, FreeBytes: 512 * 1024, AllocObjects: 1, FreeObjects: 1, Stack0: [64]uintptr{a1 + 1, a1 + 2, a2 + 3}},
+ 	}
+ 
+ 	periodType := &profile.ValueType{Type: "space", Unit: "bytes"}
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+index 6e56b4b1d1..a5a30acfd9 100644
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -3345,6 +3345,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
+ 	if trace.enabled {
+ 		traceGoCreate(newg, newg.startpc)
+ 	}
++	wakeupevent(0, newg, 1)
+ 	runqput(_p_, newg, true)
+ 
+ 	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 && mainStarted {
+diff --git a/src/runtime/runtime2.go b/src/runtime/runtime2.go
+index df9cbaef20..7b90fc1e51 100644
+--- a/src/runtime/runtime2.go
++++ b/src/runtime/runtime2.go
+@@ -304,6 +304,7 @@ type sudog struct {
+ 
+ 	acquiretime int64
+ 	releasetime int64
++	blocktime   int64
+ 	ticket      uint32
+ 	parent      *sudog // semaRoot binary tree
+ 	waitlink    *sudog // g.waiting list or semaRoot
+@@ -444,7 +445,7 @@ type m struct {
+ 	schedlink     muintptr
+ 	mcache        *mcache
+ 	lockedg       guintptr
+-	createstack   [32]uintptr    // stack that created this thread.
++	createstack   [64]uintptr    // stack that created this thread.
+ 	lockedExt     uint32         // tracking for external LockOSThread
+ 	lockedInt     uint32         // tracking for internal lockOSThread
+ 	nextwaitm     muintptr       // next m waiting for lock
+diff --git a/src/runtime/select.go b/src/runtime/select.go
+index 85be1bc64d..b129836f8f 100644
+--- a/src/runtime/select.go
++++ b/src/runtime/select.go
+@@ -133,13 +133,16 @@ func selectgo(cas0 *scase, order0 *uint16, ncases int) (int, bool) {
+ 		}
+ 	}
+ 
+-	var t0 int64
++	var t0, blocktime int64
+ 	if blockprofilerate > 0 {
+ 		t0 = cputicks()
+ 		for i := 0; i < ncases; i++ {
+ 			scases[i].releasetime = -1
+ 		}
+ 	}
++	if wakeupprofilerate > 0 {
++		blocktime = cputicks()
++	}
+ 
+ 	// The compiler rewrites selects that statically have
+ 	// only 0 or 1 cases plus default into simpler constructs.
+@@ -294,6 +297,9 @@ loop:
+ 		if t0 != 0 {
+ 			sg.releasetime = -1
+ 		}
++		if blocktime != 0 {
++			sg.blocktime = blocktime
++		}
+ 		sg.c = c
+ 		// Construct waiting list in lock order.
+ 		*nextp = sg
+diff --git a/src/runtime/sema.go b/src/runtime/sema.go
+index 18e0a398ba..3ef6733319 100644
+--- a/src/runtime/sema.go
++++ b/src/runtime/sema.go
+@@ -80,6 +80,7 @@ func readyWithTime(s *sudog, traceskip int) {
+ 	if s.releasetime != 0 {
+ 		s.releasetime = cputicks()
+ 	}
++	wakeupevent(s.blocktime, s.g, 2)
+ 	goready(s.g, traceskip)
+ }
+ 
+@@ -117,6 +118,7 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags) {
+ 	t0 := int64(0)
+ 	s.releasetime = 0
+ 	s.acquiretime = 0
++	s.blocktime = 0
+ 	s.ticket = 0
+ 	if profile&semaBlockProfile != 0 && blockprofilerate > 0 {
+ 		t0 = cputicks()
+@@ -128,6 +130,9 @@ func semacquire1(addr *uint32, lifo bool, profile semaProfileFlags) {
+ 		}
+ 		s.acquiretime = t0
+ 	}
++	if wakeupprofilerate > 0 {
++		s.blocktime = cputicks()
++	}
+ 	for {
+ 		lock(&root.lock)
+ 		// Add ourselves to nwait to disable "easy case" in semrelease.
+@@ -496,11 +501,15 @@ func notifyListWait(l *notifyList, t uint32) {
+ 	s.g = getg()
+ 	s.ticket = t
+ 	s.releasetime = 0
++	s.blocktime = 0
+ 	t0 := int64(0)
+ 	if blockprofilerate > 0 {
+ 		t0 = cputicks()
+ 		s.releasetime = -1
+ 	}
++	if wakeupprofilerate > 0 {
++		s.blocktime = cputicks()
++	}
+ 	if l.tail == nil {
+ 		l.head = s
+ 	} else {
+diff --git a/src/runtime/time.go b/src/runtime/time.go
+index 28a4722866..cdb8c70c56 100644
+--- a/src/runtime/time.go
++++ b/src/runtime/time.go
+@@ -125,6 +125,7 @@ func stopTimer(t *timer) bool {
+ 
+ // Ready the goroutine arg.
+ func goroutineReady(arg interface{}, seq uintptr) {
++	wakeupevent(0, arg.(*g), 2)
+ 	goready(arg.(*g), 0)
+ }
+ 
+@@ -162,6 +163,7 @@ func (tb *timersBucket) addtimerLocked(t *timer) bool {
+ 		}
+ 		if tb.rescheduling {
+ 			tb.rescheduling = false
++			wakeupevent(0, tb.gp, 2)
+ 			goready(tb.gp, 0)
+ 		}
+ 		if !tb.created {

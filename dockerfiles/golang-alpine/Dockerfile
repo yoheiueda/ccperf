@@ -9,7 +9,8 @@ RUN apk add --no-cache \
 RUN [ ! -e /etc/nsswitch.conf ] && echo 'hosts: files dns' > /etc/nsswitch.conf
 
 ENV GOLANG_VERSION 1.12.5
-ADD go-wakup-profile-go1.11.patch /
+ADD pprof-seconds-param.patch /
+ADD wakeup-profile.patch /
 RUN set -eux; \
 	apk add --no-cache --virtual .build-deps \
 		bash \
@@ -17,6 +18,7 @@ RUN set -eux; \
 		musl-dev \
 		openssl \
 		go \
+		patch \
 	; \
 	export \
 # set GOROOT_BOOTSTRAP such that we can actually build Go
@@ -41,8 +43,9 @@ RUN set -eux; \
 	tar -C /usr/local -xzf go.tgz; \
 	rm go.tgz; \
 	cd /usr/local/go; \
-	patch -p1 < /go-wakup-profile-go1.11.patch; \
-	rm /go-wakup-profile-go1.11.patch; \
+	patch -p1 < /wakeup-profile.patch; \
+	patch -p1 < /pprof-seconds-param.patch; \
+	rm /*.patch; \
 	\
 	cd /usr/local/go/src; \
 	./make.bash; \

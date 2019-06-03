@@ -1,0 +1,4697 @@
+commit bdd013a9ef5f8979a19b3990892574e393453143
+Author: Hana (Hyang-Ah) Kim <hyangah@gmail.com>
+Date:   Mon Nov 5 18:48:58 2018 -0500
+
+    net/http/pprof: mutex, block profiles support seconds param
+    
+    When the seconds param is given, the mutex and block profile endpoints
+    report the difference between two measurements collected the given
+    seconds apart. Historically, the mutex and block profiles have reported
+    the cumulative counts since the process start, and it turned out they
+    are more useful when interpreted along with the time duration.
+    
+    Endpoints other than mutex, block, cpu profile, and trace will continue
+    to ignore the seconds parameter.
+    
+    Fixes #23401.
+    
+    This change adds a copy of github.com/google/pprof/profile @ fde099a
+    in order to compute the profile difference. The test files are intentionally
+    omitted to minimize additional dependency.
+    Note that this is the third copy of the package in the source tree.
+    One is in src/cmd/vendor to implement go tool pprof. Another is under
+    runtime/pprof/internal to be used for runtime/pprof testing. Would be nice
+    to consolidate these three somehow in the future if we keep vendoring.
+    
+    Change-Id: Ie2486f1a63eb8ff210d7d3bc2de683e9335fd5cd
+
+diff --git a/src/cmd/api/goapi.go b/src/cmd/api/goapi.go
+index 02dfa7c841..1ee3fcbe0d 100644
+--- a/src/cmd/api/goapi.go
++++ b/src/cmd/api/goapi.go
+@@ -442,8 +442,13 @@ func (w *Walker) Import(name string) (*types.Package, error) {
+ 	}
+ 	w.imported[name] = &importing
+ 
++	root := w.root
++	if strings.HasPrefix(name, "github_com/") {
++		root = filepath.Join(root, "vendor")
++	}
++
+ 	// Determine package files.
+-	dir := filepath.Join(w.root, filepath.FromSlash(name))
++	dir := filepath.Join(root, filepath.FromSlash(name))
+ 	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+ 		log.Fatalf("no source in tree for import %q: %v", name, err)
+ 	}
+diff --git a/src/go/build/deps_test.go b/src/go/build/deps_test.go
+index 2c29a3e601..3fdf17f6e8 100644
+--- a/src/go/build/deps_test.go
++++ b/src/go/build/deps_test.go
+@@ -436,7 +436,7 @@ var pkgDeps = map[string][]string{
+ 		"internal/x/net/http/httpguts",
+ 	},
+ 	"net/http/httputil": {"L4", "NET", "OS", "context", "net/http", "net/http/internal", "internal/x/net/http/httpguts"},
+-	"net/http/pprof":    {"L4", "OS", "html/template", "net/http", "runtime/pprof", "runtime/trace"},
++	"net/http/pprof":    {"L4", "OS", "html/template", "net/http", "runtime/pprof", "runtime/trace", "github_com/google/pprof/profile"},
+ 	"net/rpc":           {"L4", "NET", "encoding/gob", "html/template", "net/http"},
+ 	"net/rpc/jsonrpc":   {"L4", "NET", "encoding/json", "net/rpc"},
+ }
+@@ -486,7 +486,7 @@ func listStdPkgs(goroot string) ([]string, error) {
+ 		}
+ 
+ 		name := filepath.ToSlash(path[len(src):])
+-		if name == "builtin" || name == "cmd" || strings.Contains(name, "internal/x/") {
++		if name == "builtin" || name == "cmd" || strings.Contains(name, "internal/x/") || strings.Contains(name, "golang_org") || strings.Contains(name, "github_com") {
+ 			return filepath.SkipDir
+ 		}
+ 
+diff --git a/src/net/http/pprof/pprof.go b/src/net/http/pprof/pprof.go
+index 35b3285a08..8b167944a7 100644
+--- a/src/net/http/pprof/pprof.go
++++ b/src/net/http/pprof/pprof.go
+@@ -55,6 +55,7 @@ import (
+ 	"bufio"
+ 	"bytes"
+ 	"fmt"
++	"github_com/google/pprof/profile"
+ 	"html/template"
+ 	"io"
+ 	"log"
+@@ -231,6 +232,26 @@ func (name handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		serveError(w, http.StatusNotFound, "Unknown profile")
+ 		return
+ 	}
++
++	if name == "block" {
++		rate, _ := strconv.Atoi(r.FormValue("rate"))
++		if rate > 0 {
++			runtime.SetBlockProfileRate(rate)
++		}
++	}
++	if name == "mutex" {
++		rate, _ := strconv.Atoi(r.FormValue("rate"))
++		if rate > 0 {
++			runtime.SetMutexProfileFraction(rate)
++		}
++	}
++
++	sec, _ := strconv.ParseInt(r.FormValue("seconds"), 10, 64)
++	if sec > 0 && profileSupportsDelta[name] {
++		name.serveDeltaProfile(w, r, p, sec)
++		return
++	}
++
+ 	gc, _ := strconv.Atoi(r.FormValue("gc"))
+ 	if name == "heap" && gc > 0 {
+ 		runtime.GC()
+@@ -245,6 +266,70 @@ func (name handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	p.WriteTo(w, debug)
+ }
+ 
++func (name handler) serveDeltaProfile(w http.ResponseWriter, r *http.Request, p *pprof.Profile, sec int64) {
++	if durationExceedsWriteTimeout(r, float64(sec)) {
++		serveError(w, http.StatusBadRequest, "profile duration exceeds server's WriteTimeout")
++		return
++	}
++	debug, _ := strconv.Atoi(r.FormValue("debug"))
++	if debug != 0 {
++		serveError(w, http.StatusBadRequest, "seconds and debug params are incompatible")
++		return
++	}
++	p0, err := collectProfile(p)
++	if err != nil {
++		serveError(w, http.StatusInternalServerError, "failed to collect profile")
++		return
++	}
++
++	t := time.NewTimer(time.Duration(sec) * time.Second)
++	defer t.Stop()
++
++	select {
++	case <-r.Context().Done():
++		serveError(w, http.StatusInternalServerError, r.Context().Err().Error())
++		return
++	case <-t.C:
++	}
++
++	p1, err := collectProfile(p)
++	if err != nil {
++		serveError(w, http.StatusInternalServerError, "failed to collect profile")
++		return
++	}
++	ts := p1.TimeNanos
++	dur := p1.TimeNanos - p0.TimeNanos
++
++	p0.Scale(-1)
++
++	p1, err = profile.Merge([]*profile.Profile{p0, p1})
++	if err != nil {
++		serveError(w, http.StatusInternalServerError, "failed to compute delta")
++		return
++	}
++
++	p1.TimeNanos = ts // set since we don't know what profile.Merge set for TimeNanos.
++	p1.DurationNanos = dur
++
++	w.Header().Set("Content-Type", "application/octet-stream")
++	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, name))
++	p1.Write(w)
++}
++
++func collectProfile(p *pprof.Profile) (*profile.Profile, error) {
++	var buf bytes.Buffer
++	if err := p.WriteTo(&buf, 0); err != nil {
++		return nil, err
++	}
++	ts := time.Now().UnixNano()
++	p0, err := profile.Parse(&buf)
++	if err != nil {
++		return nil, err
++	}
++	p0.TimeNanos = ts
++	return p0, nil
++}
++
+ var profileDescriptions = map[string]string{
+ 	"allocs":       "A sampling of all past memory allocations",
+ 	"block":        "Stack traces that led to blocking on synchronization primitives",
+@@ -257,6 +342,11 @@ var profileDescriptions = map[string]string{
+ 	"trace":        "A trace of execution of the current program. You can specify the duration in the seconds GET parameter. After you get the trace file, use the go tool trace command to investigate the trace.",
+ }
+ 
++var profileSupportsDelta = map[handler]bool{
++	"block": true,
++	"mutex": true,
++}
++
+ // Index responds with the pprof-formatted profile named by the request.
+ // For example, "/debug/pprof/heap" serves the "heap" profile.
+ // Index responds to a request for "/debug/pprof/" with an HTML page
+diff --git a/src/net/http/pprof/pprof_test.go b/src/net/http/pprof/pprof_test.go
+index dbb6fef159..d930a3c35f 100644
+--- a/src/net/http/pprof/pprof_test.go
++++ b/src/net/http/pprof/pprof_test.go
+@@ -6,11 +6,18 @@ package pprof
+ 
+ import (
+ 	"bytes"
++	"fmt"
++	"github_com/google/pprof/profile"
+ 	"io/ioutil"
+ 	"net/http"
+ 	"net/http/httptest"
++	"runtime"
+ 	"runtime/pprof"
++	"strings"
++	"sync"
++	"sync/atomic"
+ 	"testing"
++	"time"
+ )
+ 
+ // TestDescriptions checks that the profile names under runtime/pprof package
+@@ -79,3 +86,173 @@ func TestHandlers(t *testing.T) {
+ 	}
+ 
+ }
++
++var Sink uint32
++
++func mutexHog1(mu1, mu2 *sync.Mutex, start time.Time, dt time.Duration) {
++	atomic.AddUint32(&Sink, 1)
++	for time.Since(start) < dt {
++		// When using gccgo the loop of mutex operations is
++		// not preemptible. This can cause the loop to block a GC,
++		// causing the time limits in TestDeltaContentionz to fail.
++		// Since this loop is not very realistic, when using
++		// gccgo add preemption points 100 times a second.
++		t1 := time.Now()
++		for time.Since(start) < dt && time.Since(t1) < 10*time.Millisecond {
++			mu1.Lock()
++			mu2.Lock()
++			mu1.Unlock()
++			mu2.Unlock()
++		}
++		if runtime.Compiler == "gccgo" {
++			runtime.Gosched()
++		}
++	}
++}
++
++// mutexHog2 is almost identical to mutexHog but we keep them separate
++// in order to distinguish them with function names in the stack trace.
++// We make them slightly different, using Sink, because otherwise
++// gccgo -c opt will merge them.
++func mutexHog2(mu1, mu2 *sync.Mutex, start time.Time, dt time.Duration) {
++	atomic.AddUint32(&Sink, 2)
++	for time.Since(start) < dt {
++		// See comment in mutexHog.
++		t1 := time.Now()
++		for time.Since(start) < dt && time.Since(t1) < 10*time.Millisecond {
++			mu1.Lock()
++			mu2.Lock()
++			mu1.Unlock()
++			mu2.Unlock()
++		}
++		if runtime.Compiler == "gccgo" {
++			runtime.Gosched()
++		}
++	}
++}
++
++func hog(dt time.Duration, hogger func(mu1, mu2 *sync.Mutex, start time.Time, dt time.Duration)) {
++	start := time.Now()
++	mu1 := new(sync.Mutex)
++	mu2 := new(sync.Mutex)
++	var wg sync.WaitGroup
++	wg.Add(10)
++	for i := 0; i < 10; i++ {
++		go func() {
++			defer wg.Done()
++			hogger(mu1, mu2, start, dt)
++		}()
++	}
++	wg.Wait()
++}
++
++func TestDeltaProfile(t *testing.T) {
++	rate := runtime.SetMutexProfileFraction(1)
++	defer func() {
++		runtime.SetMutexProfileFraction(rate)
++	}()
++
++	// mutexHog1 will appear in non-delta mutex profile.
++	hog(10*time.Millisecond, mutexHog1)
++
++	// causes mutexHog2 call stacks to appear mutex profile.
++	done := make(chan bool)
++	go func() {
++		for i := 0; ; i++ {
++			hog(10*time.Millisecond, mutexHog2)
++			select {
++			case <-done:
++				done <- true
++				return
++			default:
++				time.Sleep(10 * time.Millisecond)
++			}
++		}
++	}()
++	defer func() { // cleanup the above goroutine.
++		done <- true
++		<-done // wait for the goroutine to exit.
++	}()
++
++	for _, tc := range []struct {
++		seconds              int
++		mutexHog1, mutexHog2 bool
++	}{
++		{1, false, true},
++		{0, true, true},
++	} {
++		endpoint := "/debug/pprof/mutex"
++		if tc.seconds > 0 {
++			endpoint = fmt.Sprintf("/debug/pprof/mutex?seconds=%d", tc.seconds)
++		}
++
++		t.Run(endpoint, func(t *testing.T) {
++			out, err := query(endpoint)
++			if err != nil {
++				t.Fatalf("query failed: %v", err)
++			}
++			p, err := profile.Parse(bytes.NewBuffer(out))
++			if err != nil {
++				t.Fatalf("failed to parse output (%v): %q", err, out)
++			}
++
++			if got := seen(p, "mutexHog1"); got != tc.mutexHog1 {
++				t.Errorf("seen(mutexHog1) = %t, want %t", got, tc.mutexHog1)
++			}
++			if got := seen(p, "mutexHog2"); got != tc.mutexHog2 {
++				t.Errorf("seen(mutexHog2) = %t, want %t", got, tc.mutexHog2)
++			}
++
++			if tc.seconds > 0 {
++				got := time.Duration(p.DurationNanos) * time.Nanosecond
++				want := time.Duration(tc.seconds) * time.Second
++				if got < want/2 || got > 2*want {
++					t.Errorf("got duration = %v; want ~%v", got, want)
++				}
++			}
++
++		})
++	}
++}
++
++var srv = httptest.NewServer(nil)
++
++func query(endpoint string) ([]byte, error) {
++	url := srv.URL + endpoint
++	r, err := http.Get(url)
++	if err != nil {
++		return nil, fmt.Errorf("failed to fetch %q: %v", url, err)
++	}
++	if r.StatusCode != http.StatusOK {
++		return nil, fmt.Errorf("failed to fetch %q: %v", url, r.Status)
++	}
++
++	b, err := ioutil.ReadAll(r.Body)
++	r.Body.Close()
++	if err != nil {
++		return nil, fmt.Errorf("failed to read and parse the result from %q: %v", url, err)
++	}
++	return b, nil
++}
++
++// seen returns true if the profile includes samples whose stacks include
++// the specified function name (fname).
++func seen(p *profile.Profile, fname string) bool {
++	locIDs := map[*profile.Location]bool{}
++	for _, loc := range p.Location {
++		for _, l := range loc.Line {
++			if strings.Contains(l.Function.Name, fname) {
++				locIDs[loc] = true
++				break
++			}
++		}
++	}
++	for _, sample := range p.Sample {
++		for _, loc := range sample.Location {
++			if locIDs[loc] {
++				return true
++			}
++		}
++	}
++	return false
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/encode.go b/src/vendor/github_com/google/pprof/profile/encode.go
+new file mode 100644
+index 0000000000..1e84c72d43
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/encode.go
+@@ -0,0 +1,567 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package profile
++
++import (
++	"errors"
++	"sort"
++)
++
++func (p *Profile) decoder() []decoder {
++	return profileDecoder
++}
++
++// preEncode populates the unexported fields to be used by encode
++// (with suffix X) from the corresponding exported fields. The
++// exported fields are cleared up to facilitate testing.
++func (p *Profile) preEncode() {
++	strings := make(map[string]int)
++	addString(strings, "")
++
++	for _, st := range p.SampleType {
++		st.typeX = addString(strings, st.Type)
++		st.unitX = addString(strings, st.Unit)
++	}
++
++	for _, s := range p.Sample {
++		s.labelX = nil
++		var keys []string
++		for k := range s.Label {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		for _, k := range keys {
++			vs := s.Label[k]
++			for _, v := range vs {
++				s.labelX = append(s.labelX,
++					label{
++						keyX: addString(strings, k),
++						strX: addString(strings, v),
++					},
++				)
++			}
++		}
++		var numKeys []string
++		for k := range s.NumLabel {
++			numKeys = append(numKeys, k)
++		}
++		sort.Strings(numKeys)
++		for _, k := range numKeys {
++			keyX := addString(strings, k)
++			vs := s.NumLabel[k]
++			units := s.NumUnit[k]
++			for i, v := range vs {
++				var unitX int64
++				if len(units) != 0 {
++					unitX = addString(strings, units[i])
++				}
++				s.labelX = append(s.labelX,
++					label{
++						keyX:  keyX,
++						numX:  v,
++						unitX: unitX,
++					},
++				)
++			}
++		}
++		s.locationIDX = make([]uint64, len(s.Location))
++		for i, loc := range s.Location {
++			s.locationIDX[i] = loc.ID
++		}
++	}
++
++	for _, m := range p.Mapping {
++		m.fileX = addString(strings, m.File)
++		m.buildIDX = addString(strings, m.BuildID)
++	}
++
++	for _, l := range p.Location {
++		for i, ln := range l.Line {
++			if ln.Function != nil {
++				l.Line[i].functionIDX = ln.Function.ID
++			} else {
++				l.Line[i].functionIDX = 0
++			}
++		}
++		if l.Mapping != nil {
++			l.mappingIDX = l.Mapping.ID
++		} else {
++			l.mappingIDX = 0
++		}
++	}
++	for _, f := range p.Function {
++		f.nameX = addString(strings, f.Name)
++		f.systemNameX = addString(strings, f.SystemName)
++		f.filenameX = addString(strings, f.Filename)
++	}
++
++	p.dropFramesX = addString(strings, p.DropFrames)
++	p.keepFramesX = addString(strings, p.KeepFrames)
++
++	if pt := p.PeriodType; pt != nil {
++		pt.typeX = addString(strings, pt.Type)
++		pt.unitX = addString(strings, pt.Unit)
++	}
++
++	p.commentX = nil
++	for _, c := range p.Comments {
++		p.commentX = append(p.commentX, addString(strings, c))
++	}
++
++	p.defaultSampleTypeX = addString(strings, p.DefaultSampleType)
++
++	p.stringTable = make([]string, len(strings))
++	for s, i := range strings {
++		p.stringTable[i] = s
++	}
++}
++
++func (p *Profile) encode(b *buffer) {
++	for _, x := range p.SampleType {
++		encodeMessage(b, 1, x)
++	}
++	for _, x := range p.Sample {
++		encodeMessage(b, 2, x)
++	}
++	for _, x := range p.Mapping {
++		encodeMessage(b, 3, x)
++	}
++	for _, x := range p.Location {
++		encodeMessage(b, 4, x)
++	}
++	for _, x := range p.Function {
++		encodeMessage(b, 5, x)
++	}
++	encodeStrings(b, 6, p.stringTable)
++	encodeInt64Opt(b, 7, p.dropFramesX)
++	encodeInt64Opt(b, 8, p.keepFramesX)
++	encodeInt64Opt(b, 9, p.TimeNanos)
++	encodeInt64Opt(b, 10, p.DurationNanos)
++	if pt := p.PeriodType; pt != nil && (pt.typeX != 0 || pt.unitX != 0) {
++		encodeMessage(b, 11, p.PeriodType)
++	}
++	encodeInt64Opt(b, 12, p.Period)
++	encodeInt64s(b, 13, p.commentX)
++	encodeInt64(b, 14, p.defaultSampleTypeX)
++}
++
++var profileDecoder = []decoder{
++	nil, // 0
++	// repeated ValueType sample_type = 1
++	func(b *buffer, m message) error {
++		x := new(ValueType)
++		pp := m.(*Profile)
++		pp.SampleType = append(pp.SampleType, x)
++		return decodeMessage(b, x)
++	},
++	// repeated Sample sample = 2
++	func(b *buffer, m message) error {
++		x := new(Sample)
++		pp := m.(*Profile)
++		pp.Sample = append(pp.Sample, x)
++		return decodeMessage(b, x)
++	},
++	// repeated Mapping mapping = 3
++	func(b *buffer, m message) error {
++		x := new(Mapping)
++		pp := m.(*Profile)
++		pp.Mapping = append(pp.Mapping, x)
++		return decodeMessage(b, x)
++	},
++	// repeated Location location = 4
++	func(b *buffer, m message) error {
++		x := new(Location)
++		x.Line = make([]Line, 0, 8) // Pre-allocate Line buffer
++		pp := m.(*Profile)
++		pp.Location = append(pp.Location, x)
++		err := decodeMessage(b, x)
++		var tmp []Line
++		x.Line = append(tmp, x.Line...) // Shrink to allocated size
++		return err
++	},
++	// repeated Function function = 5
++	func(b *buffer, m message) error {
++		x := new(Function)
++		pp := m.(*Profile)
++		pp.Function = append(pp.Function, x)
++		return decodeMessage(b, x)
++	},
++	// repeated string string_table = 6
++	func(b *buffer, m message) error {
++		err := decodeStrings(b, &m.(*Profile).stringTable)
++		if err != nil {
++			return err
++		}
++		if m.(*Profile).stringTable[0] != "" {
++			return errors.New("string_table[0] must be ''")
++		}
++		return nil
++	},
++	// int64 drop_frames = 7
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Profile).dropFramesX) },
++	// int64 keep_frames = 8
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Profile).keepFramesX) },
++	// int64 time_nanos = 9
++	func(b *buffer, m message) error {
++		if m.(*Profile).TimeNanos != 0 {
++			return errConcatProfile
++		}
++		return decodeInt64(b, &m.(*Profile).TimeNanos)
++	},
++	// int64 duration_nanos = 10
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Profile).DurationNanos) },
++	// ValueType period_type = 11
++	func(b *buffer, m message) error {
++		x := new(ValueType)
++		pp := m.(*Profile)
++		pp.PeriodType = x
++		return decodeMessage(b, x)
++	},
++	// int64 period = 12
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Profile).Period) },
++	// repeated int64 comment = 13
++	func(b *buffer, m message) error { return decodeInt64s(b, &m.(*Profile).commentX) },
++	// int64 defaultSampleType = 14
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Profile).defaultSampleTypeX) },
++}
++
++// postDecode takes the unexported fields populated by decode (with
++// suffix X) and populates the corresponding exported fields.
++// The unexported fields are cleared up to facilitate testing.
++func (p *Profile) postDecode() error {
++	var err error
++	mappings := make(map[uint64]*Mapping, len(p.Mapping))
++	mappingIds := make([]*Mapping, len(p.Mapping)+1)
++	for _, m := range p.Mapping {
++		m.File, err = getString(p.stringTable, &m.fileX, err)
++		m.BuildID, err = getString(p.stringTable, &m.buildIDX, err)
++		if m.ID < uint64(len(mappingIds)) {
++			mappingIds[m.ID] = m
++		} else {
++			mappings[m.ID] = m
++		}
++	}
++
++	functions := make(map[uint64]*Function, len(p.Function))
++	functionIds := make([]*Function, len(p.Function)+1)
++	for _, f := range p.Function {
++		f.Name, err = getString(p.stringTable, &f.nameX, err)
++		f.SystemName, err = getString(p.stringTable, &f.systemNameX, err)
++		f.Filename, err = getString(p.stringTable, &f.filenameX, err)
++		if f.ID < uint64(len(functionIds)) {
++			functionIds[f.ID] = f
++		} else {
++			functions[f.ID] = f
++		}
++	}
++
++	locations := make(map[uint64]*Location, len(p.Location))
++	locationIds := make([]*Location, len(p.Location)+1)
++	for _, l := range p.Location {
++		if id := l.mappingIDX; id < uint64(len(mappingIds)) {
++			l.Mapping = mappingIds[id]
++		} else {
++			l.Mapping = mappings[id]
++		}
++		l.mappingIDX = 0
++		for i, ln := range l.Line {
++			if id := ln.functionIDX; id != 0 {
++				l.Line[i].functionIDX = 0
++				if id < uint64(len(functionIds)) {
++					l.Line[i].Function = functionIds[id]
++				} else {
++					l.Line[i].Function = functions[id]
++				}
++			}
++		}
++		if l.ID < uint64(len(locationIds)) {
++			locationIds[l.ID] = l
++		} else {
++			locations[l.ID] = l
++		}
++	}
++
++	for _, st := range p.SampleType {
++		st.Type, err = getString(p.stringTable, &st.typeX, err)
++		st.Unit, err = getString(p.stringTable, &st.unitX, err)
++	}
++
++	for _, s := range p.Sample {
++		labels := make(map[string][]string, len(s.labelX))
++		numLabels := make(map[string][]int64, len(s.labelX))
++		numUnits := make(map[string][]string, len(s.labelX))
++		for _, l := range s.labelX {
++			var key, value string
++			key, err = getString(p.stringTable, &l.keyX, err)
++			if l.strX != 0 {
++				value, err = getString(p.stringTable, &l.strX, err)
++				labels[key] = append(labels[key], value)
++			} else if l.numX != 0 {
++				numValues := numLabels[key]
++				units := numUnits[key]
++				if l.unitX != 0 {
++					var unit string
++					unit, err = getString(p.stringTable, &l.unitX, err)
++					units = padStringArray(units, len(numValues))
++					numUnits[key] = append(units, unit)
++				}
++				numLabels[key] = append(numLabels[key], l.numX)
++			}
++		}
++		if len(labels) > 0 {
++			s.Label = labels
++		}
++		if len(numLabels) > 0 {
++			s.NumLabel = numLabels
++			for key, units := range numUnits {
++				if len(units) > 0 {
++					numUnits[key] = padStringArray(units, len(numLabels[key]))
++				}
++			}
++			s.NumUnit = numUnits
++		}
++		s.Location = make([]*Location, len(s.locationIDX))
++		for i, lid := range s.locationIDX {
++			if lid < uint64(len(locationIds)) {
++				s.Location[i] = locationIds[lid]
++			} else {
++				s.Location[i] = locations[lid]
++			}
++		}
++		s.locationIDX = nil
++	}
++
++	p.DropFrames, err = getString(p.stringTable, &p.dropFramesX, err)
++	p.KeepFrames, err = getString(p.stringTable, &p.keepFramesX, err)
++
++	if pt := p.PeriodType; pt == nil {
++		p.PeriodType = &ValueType{}
++	}
++
++	if pt := p.PeriodType; pt != nil {
++		pt.Type, err = getString(p.stringTable, &pt.typeX, err)
++		pt.Unit, err = getString(p.stringTable, &pt.unitX, err)
++	}
++
++	for _, i := range p.commentX {
++		var c string
++		c, err = getString(p.stringTable, &i, err)
++		p.Comments = append(p.Comments, c)
++	}
++
++	p.commentX = nil
++	p.DefaultSampleType, err = getString(p.stringTable, &p.defaultSampleTypeX, err)
++	p.stringTable = nil
++	return err
++}
++
++// padStringArray pads arr with enough empty strings to make arr
++// length l when arr's length is less than l.
++func padStringArray(arr []string, l int) []string {
++	if l <= len(arr) {
++		return arr
++	}
++	return append(arr, make([]string, l-len(arr))...)
++}
++
++func (p *ValueType) decoder() []decoder {
++	return valueTypeDecoder
++}
++
++func (p *ValueType) encode(b *buffer) {
++	encodeInt64Opt(b, 1, p.typeX)
++	encodeInt64Opt(b, 2, p.unitX)
++}
++
++var valueTypeDecoder = []decoder{
++	nil, // 0
++	// optional int64 type = 1
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*ValueType).typeX) },
++	// optional int64 unit = 2
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*ValueType).unitX) },
++}
++
++func (p *Sample) decoder() []decoder {
++	return sampleDecoder
++}
++
++func (p *Sample) encode(b *buffer) {
++	encodeUint64s(b, 1, p.locationIDX)
++	encodeInt64s(b, 2, p.Value)
++	for _, x := range p.labelX {
++		encodeMessage(b, 3, x)
++	}
++}
++
++var sampleDecoder = []decoder{
++	nil, // 0
++	// repeated uint64 location = 1
++	func(b *buffer, m message) error { return decodeUint64s(b, &m.(*Sample).locationIDX) },
++	// repeated int64 value = 2
++	func(b *buffer, m message) error { return decodeInt64s(b, &m.(*Sample).Value) },
++	// repeated Label label = 3
++	func(b *buffer, m message) error {
++		s := m.(*Sample)
++		n := len(s.labelX)
++		s.labelX = append(s.labelX, label{})
++		return decodeMessage(b, &s.labelX[n])
++	},
++}
++
++func (p label) decoder() []decoder {
++	return labelDecoder
++}
++
++func (p label) encode(b *buffer) {
++	encodeInt64Opt(b, 1, p.keyX)
++	encodeInt64Opt(b, 2, p.strX)
++	encodeInt64Opt(b, 3, p.numX)
++	encodeInt64Opt(b, 4, p.unitX)
++}
++
++var labelDecoder = []decoder{
++	nil, // 0
++	// optional int64 key = 1
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*label).keyX) },
++	// optional int64 str = 2
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*label).strX) },
++	// optional int64 num = 3
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*label).numX) },
++	// optional int64 num = 4
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*label).unitX) },
++}
++
++func (p *Mapping) decoder() []decoder {
++	return mappingDecoder
++}
++
++func (p *Mapping) encode(b *buffer) {
++	encodeUint64Opt(b, 1, p.ID)
++	encodeUint64Opt(b, 2, p.Start)
++	encodeUint64Opt(b, 3, p.Limit)
++	encodeUint64Opt(b, 4, p.Offset)
++	encodeInt64Opt(b, 5, p.fileX)
++	encodeInt64Opt(b, 6, p.buildIDX)
++	encodeBoolOpt(b, 7, p.HasFunctions)
++	encodeBoolOpt(b, 8, p.HasFilenames)
++	encodeBoolOpt(b, 9, p.HasLineNumbers)
++	encodeBoolOpt(b, 10, p.HasInlineFrames)
++}
++
++var mappingDecoder = []decoder{
++	nil, // 0
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Mapping).ID) },            // optional uint64 id = 1
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Mapping).Start) },         // optional uint64 memory_offset = 2
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Mapping).Limit) },         // optional uint64 memory_limit = 3
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Mapping).Offset) },        // optional uint64 file_offset = 4
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Mapping).fileX) },          // optional int64 filename = 5
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Mapping).buildIDX) },       // optional int64 build_id = 6
++	func(b *buffer, m message) error { return decodeBool(b, &m.(*Mapping).HasFunctions) },    // optional bool has_functions = 7
++	func(b *buffer, m message) error { return decodeBool(b, &m.(*Mapping).HasFilenames) },    // optional bool has_filenames = 8
++	func(b *buffer, m message) error { return decodeBool(b, &m.(*Mapping).HasLineNumbers) },  // optional bool has_line_numbers = 9
++	func(b *buffer, m message) error { return decodeBool(b, &m.(*Mapping).HasInlineFrames) }, // optional bool has_inline_frames = 10
++}
++
++func (p *Location) decoder() []decoder {
++	return locationDecoder
++}
++
++func (p *Location) encode(b *buffer) {
++	encodeUint64Opt(b, 1, p.ID)
++	encodeUint64Opt(b, 2, p.mappingIDX)
++	encodeUint64Opt(b, 3, p.Address)
++	for i := range p.Line {
++		encodeMessage(b, 4, &p.Line[i])
++	}
++	encodeBoolOpt(b, 5, p.IsFolded)
++}
++
++var locationDecoder = []decoder{
++	nil, // 0
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Location).ID) },         // optional uint64 id = 1;
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Location).mappingIDX) }, // optional uint64 mapping_id = 2;
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Location).Address) },    // optional uint64 address = 3;
++	func(b *buffer, m message) error { // repeated Line line = 4
++		pp := m.(*Location)
++		n := len(pp.Line)
++		pp.Line = append(pp.Line, Line{})
++		return decodeMessage(b, &pp.Line[n])
++	},
++	func(b *buffer, m message) error { return decodeBool(b, &m.(*Location).IsFolded) }, // optional bool is_folded = 5;
++}
++
++func (p *Line) decoder() []decoder {
++	return lineDecoder
++}
++
++func (p *Line) encode(b *buffer) {
++	encodeUint64Opt(b, 1, p.functionIDX)
++	encodeInt64Opt(b, 2, p.Line)
++}
++
++var lineDecoder = []decoder{
++	nil, // 0
++	// optional uint64 function_id = 1
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Line).functionIDX) },
++	// optional int64 line = 2
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Line).Line) },
++}
++
++func (p *Function) decoder() []decoder {
++	return functionDecoder
++}
++
++func (p *Function) encode(b *buffer) {
++	encodeUint64Opt(b, 1, p.ID)
++	encodeInt64Opt(b, 2, p.nameX)
++	encodeInt64Opt(b, 3, p.systemNameX)
++	encodeInt64Opt(b, 4, p.filenameX)
++	encodeInt64Opt(b, 5, p.StartLine)
++}
++
++var functionDecoder = []decoder{
++	nil, // 0
++	// optional uint64 id = 1
++	func(b *buffer, m message) error { return decodeUint64(b, &m.(*Function).ID) },
++	// optional int64 function_name = 2
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Function).nameX) },
++	// optional int64 function_system_name = 3
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Function).systemNameX) },
++	// repeated int64 filename = 4
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Function).filenameX) },
++	// optional int64 start_line = 5
++	func(b *buffer, m message) error { return decodeInt64(b, &m.(*Function).StartLine) },
++}
++
++func addString(strings map[string]int, s string) int64 {
++	i, ok := strings[s]
++	if !ok {
++		i = len(strings)
++		strings[s] = i
++	}
++	return int64(i)
++}
++
++func getString(strings []string, strng *int64, err error) (string, error) {
++	if err != nil {
++		return "", err
++	}
++	s := int(*strng)
++	if s < 0 || s >= len(strings) {
++		return "", errMalformed
++	}
++	*strng = 0
++	return strings[s], nil
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/filter.go b/src/vendor/github_com/google/pprof/profile/filter.go
+new file mode 100644
+index 0000000000..ea8e66c68d
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/filter.go
+@@ -0,0 +1,270 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package profile
++
++// Implements methods to filter samples from profiles.
++
++import "regexp"
++
++// FilterSamplesByName filters the samples in a profile and only keeps
++// samples where at least one frame matches focus but none match ignore.
++// Returns true is the corresponding regexp matched at least one sample.
++func (p *Profile) FilterSamplesByName(focus, ignore, hide, show *regexp.Regexp) (fm, im, hm, hnm bool) {
++	focusOrIgnore := make(map[uint64]bool)
++	hidden := make(map[uint64]bool)
++	for _, l := range p.Location {
++		if ignore != nil && l.matchesName(ignore) {
++			im = true
++			focusOrIgnore[l.ID] = false
++		} else if focus == nil || l.matchesName(focus) {
++			fm = true
++			focusOrIgnore[l.ID] = true
++		}
++
++		if hide != nil && l.matchesName(hide) {
++			hm = true
++			l.Line = l.unmatchedLines(hide)
++			if len(l.Line) == 0 {
++				hidden[l.ID] = true
++			}
++		}
++		if show != nil {
++			l.Line = l.matchedLines(show)
++			if len(l.Line) == 0 {
++				hidden[l.ID] = true
++			} else {
++				hnm = true
++			}
++		}
++	}
++
++	s := make([]*Sample, 0, len(p.Sample))
++	for _, sample := range p.Sample {
++		if focusedAndNotIgnored(sample.Location, focusOrIgnore) {
++			if len(hidden) > 0 {
++				var locs []*Location
++				for _, loc := range sample.Location {
++					if !hidden[loc.ID] {
++						locs = append(locs, loc)
++					}
++				}
++				if len(locs) == 0 {
++					// Remove sample with no locations (by not adding it to s).
++					continue
++				}
++				sample.Location = locs
++			}
++			s = append(s, sample)
++		}
++	}
++	p.Sample = s
++
++	return
++}
++
++// ShowFrom drops all stack frames above the highest matching frame and returns
++// whether a match was found. If showFrom is nil it returns false and does not
++// modify the profile.
++//
++// Example: consider a sample with frames [A, B, C, B], where A is the root.
++// ShowFrom(nil) returns false and has frames [A, B, C, B].
++// ShowFrom(A) returns true and has frames [A, B, C, B].
++// ShowFrom(B) returns true and has frames [B, C, B].
++// ShowFrom(C) returns true and has frames [C, B].
++// ShowFrom(D) returns false and drops the sample because no frames remain.
++func (p *Profile) ShowFrom(showFrom *regexp.Regexp) (matched bool) {
++	if showFrom == nil {
++		return false
++	}
++	// showFromLocs stores location IDs that matched ShowFrom.
++	showFromLocs := make(map[uint64]bool)
++	// Apply to locations.
++	for _, loc := range p.Location {
++		if filterShowFromLocation(loc, showFrom) {
++			showFromLocs[loc.ID] = true
++			matched = true
++		}
++	}
++	// For all samples, strip locations after the highest matching one.
++	s := make([]*Sample, 0, len(p.Sample))
++	for _, sample := range p.Sample {
++		for i := len(sample.Location) - 1; i >= 0; i-- {
++			if showFromLocs[sample.Location[i].ID] {
++				sample.Location = sample.Location[:i+1]
++				s = append(s, sample)
++				break
++			}
++		}
++	}
++	p.Sample = s
++	return matched
++}
++
++// filterShowFromLocation tests a showFrom regex against a location, removes
++// lines after the last match and returns whether a match was found. If the
++// mapping is matched, then all lines are kept.
++func filterShowFromLocation(loc *Location, showFrom *regexp.Regexp) bool {
++	if m := loc.Mapping; m != nil && showFrom.MatchString(m.File) {
++		return true
++	}
++	if i := loc.lastMatchedLineIndex(showFrom); i >= 0 {
++		loc.Line = loc.Line[:i+1]
++		return true
++	}
++	return false
++}
++
++// lastMatchedLineIndex returns the index of the last line that matches a regex,
++// or -1 if no match is found.
++func (loc *Location) lastMatchedLineIndex(re *regexp.Regexp) int {
++	for i := len(loc.Line) - 1; i >= 0; i-- {
++		if fn := loc.Line[i].Function; fn != nil {
++			if re.MatchString(fn.Name) || re.MatchString(fn.Filename) {
++				return i
++			}
++		}
++	}
++	return -1
++}
++
++// FilterTagsByName filters the tags in a profile and only keeps
++// tags that match show and not hide.
++func (p *Profile) FilterTagsByName(show, hide *regexp.Regexp) (sm, hm bool) {
++	matchRemove := func(name string) bool {
++		matchShow := show == nil || show.MatchString(name)
++		matchHide := hide != nil && hide.MatchString(name)
++
++		if matchShow {
++			sm = true
++		}
++		if matchHide {
++			hm = true
++		}
++		return !matchShow || matchHide
++	}
++	for _, s := range p.Sample {
++		for lab := range s.Label {
++			if matchRemove(lab) {
++				delete(s.Label, lab)
++			}
++		}
++		for lab := range s.NumLabel {
++			if matchRemove(lab) {
++				delete(s.NumLabel, lab)
++			}
++		}
++	}
++	return
++}
++
++// matchesName returns whether the location matches the regular
++// expression. It checks any available function names, file names, and
++// mapping object filename.
++func (loc *Location) matchesName(re *regexp.Regexp) bool {
++	for _, ln := range loc.Line {
++		if fn := ln.Function; fn != nil {
++			if re.MatchString(fn.Name) || re.MatchString(fn.Filename) {
++				return true
++			}
++		}
++	}
++	if m := loc.Mapping; m != nil && re.MatchString(m.File) {
++		return true
++	}
++	return false
++}
++
++// unmatchedLines returns the lines in the location that do not match
++// the regular expression.
++func (loc *Location) unmatchedLines(re *regexp.Regexp) []Line {
++	if m := loc.Mapping; m != nil && re.MatchString(m.File) {
++		return nil
++	}
++	var lines []Line
++	for _, ln := range loc.Line {
++		if fn := ln.Function; fn != nil {
++			if re.MatchString(fn.Name) || re.MatchString(fn.Filename) {
++				continue
++			}
++		}
++		lines = append(lines, ln)
++	}
++	return lines
++}
++
++// matchedLines returns the lines in the location that match
++// the regular expression.
++func (loc *Location) matchedLines(re *regexp.Regexp) []Line {
++	if m := loc.Mapping; m != nil && re.MatchString(m.File) {
++		return loc.Line
++	}
++	var lines []Line
++	for _, ln := range loc.Line {
++		if fn := ln.Function; fn != nil {
++			if !re.MatchString(fn.Name) && !re.MatchString(fn.Filename) {
++				continue
++			}
++		}
++		lines = append(lines, ln)
++	}
++	return lines
++}
++
++// focusedAndNotIgnored looks up a slice of ids against a map of
++// focused/ignored locations. The map only contains locations that are
++// explicitly focused or ignored. Returns whether there is at least
++// one focused location but no ignored locations.
++func focusedAndNotIgnored(locs []*Location, m map[uint64]bool) bool {
++	var f bool
++	for _, loc := range locs {
++		if focus, focusOrIgnore := m[loc.ID]; focusOrIgnore {
++			if focus {
++				// Found focused location. Must keep searching in case there
++				// is an ignored one as well.
++				f = true
++			} else {
++				// Found ignored location. Can return false right away.
++				return false
++			}
++		}
++	}
++	return f
++}
++
++// TagMatch selects tags for filtering
++type TagMatch func(s *Sample) bool
++
++// FilterSamplesByTag removes all samples from the profile, except
++// those that match focus and do not match the ignore regular
++// expression.
++func (p *Profile) FilterSamplesByTag(focus, ignore TagMatch) (fm, im bool) {
++	samples := make([]*Sample, 0, len(p.Sample))
++	for _, s := range p.Sample {
++		focused, ignored := true, false
++		if focus != nil {
++			focused = focus(s)
++		}
++		if ignore != nil {
++			ignored = ignore(s)
++		}
++		fm = fm || focused
++		im = im || ignored
++		if focused && !ignored {
++			samples = append(samples, s)
++		}
++	}
++	p.Sample = samples
++	return
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/index.go b/src/vendor/github_com/google/pprof/profile/index.go
+new file mode 100644
+index 0000000000..bef1d60467
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/index.go
+@@ -0,0 +1,64 @@
++// Copyright 2016 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package profile
++
++import (
++	"fmt"
++	"strconv"
++	"strings"
++)
++
++// SampleIndexByName returns the appropriate index for a value of sample index.
++// If numeric, it returns the number, otherwise it looks up the text in the
++// profile sample types.
++func (p *Profile) SampleIndexByName(sampleIndex string) (int, error) {
++	if sampleIndex == "" {
++		if dst := p.DefaultSampleType; dst != "" {
++			for i, t := range sampleTypes(p) {
++				if t == dst {
++					return i, nil
++				}
++			}
++		}
++		// By default select the last sample value
++		return len(p.SampleType) - 1, nil
++	}
++	if i, err := strconv.Atoi(sampleIndex); err == nil {
++		if i < 0 || i >= len(p.SampleType) {
++			return 0, fmt.Errorf("sample_index %s is outside the range [0..%d]", sampleIndex, len(p.SampleType)-1)
++		}
++		return i, nil
++	}
++
++	// Remove the inuse_ prefix to support legacy pprof options
++	// "inuse_space" and "inuse_objects" for profiles containing types
++	// "space" and "objects".
++	noInuse := strings.TrimPrefix(sampleIndex, "inuse_")
++	for i, t := range p.SampleType {
++		if t.Type == sampleIndex || t.Type == noInuse {
++			return i, nil
++		}
++	}
++
++	return 0, fmt.Errorf("sample_index %q must be one of: %v", sampleIndex, sampleTypes(p))
++}
++
++func sampleTypes(p *Profile) []string {
++	types := make([]string, len(p.SampleType))
++	for i, t := range p.SampleType {
++		types[i] = t.Type
++	}
++	return types
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/legacy_java_profile.go b/src/vendor/github_com/google/pprof/profile/legacy_java_profile.go
+new file mode 100644
+index 0000000000..91f45e53c6
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/legacy_java_profile.go
+@@ -0,0 +1,315 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// This file implements parsers to convert java legacy profiles into
++// the profile.proto format.
++
++package profile
++
++import (
++	"bytes"
++	"fmt"
++	"io"
++	"path/filepath"
++	"regexp"
++	"strconv"
++	"strings"
++)
++
++var (
++	attributeRx            = regexp.MustCompile(`([\w ]+)=([\w ]+)`)
++	javaSampleRx           = regexp.MustCompile(` *(\d+) +(\d+) +@ +([ x0-9a-f]*)`)
++	javaLocationRx         = regexp.MustCompile(`^\s*0x([[:xdigit:]]+)\s+(.*)\s*$`)
++	javaLocationFileLineRx = regexp.MustCompile(`^(.*)\s+\((.+):(-?[[:digit:]]+)\)$`)
++	javaLocationPathRx     = regexp.MustCompile(`^(.*)\s+\((.*)\)$`)
++)
++
++// javaCPUProfile returns a new Profile from profilez data.
++// b is the profile bytes after the header, period is the profiling
++// period, and parse is a function to parse 8-byte chunks from the
++// profile in its native endianness.
++func javaCPUProfile(b []byte, period int64, parse func(b []byte) (uint64, []byte)) (*Profile, error) {
++	p := &Profile{
++		Period:     period * 1000,
++		PeriodType: &ValueType{Type: "cpu", Unit: "nanoseconds"},
++		SampleType: []*ValueType{{Type: "samples", Unit: "count"}, {Type: "cpu", Unit: "nanoseconds"}},
++	}
++	var err error
++	var locs map[uint64]*Location
++	if b, locs, err = parseCPUSamples(b, parse, false, p); err != nil {
++		return nil, err
++	}
++
++	if err = parseJavaLocations(b, locs, p); err != nil {
++		return nil, err
++	}
++
++	// Strip out addresses for better merge.
++	if err = p.Aggregate(true, true, true, true, false); err != nil {
++		return nil, err
++	}
++
++	return p, nil
++}
++
++// parseJavaProfile returns a new profile from heapz or contentionz
++// data. b is the profile bytes after the header.
++func parseJavaProfile(b []byte) (*Profile, error) {
++	h := bytes.SplitAfterN(b, []byte("\n"), 2)
++	if len(h) < 2 {
++		return nil, errUnrecognized
++	}
++
++	p := &Profile{
++		PeriodType: &ValueType{},
++	}
++	header := string(bytes.TrimSpace(h[0]))
++
++	var err error
++	var pType string
++	switch header {
++	case "--- heapz 1 ---":
++		pType = "heap"
++	case "--- contentionz 1 ---":
++		pType = "contention"
++	default:
++		return nil, errUnrecognized
++	}
++
++	if b, err = parseJavaHeader(pType, h[1], p); err != nil {
++		return nil, err
++	}
++	var locs map[uint64]*Location
++	if b, locs, err = parseJavaSamples(pType, b, p); err != nil {
++		return nil, err
++	}
++	if err = parseJavaLocations(b, locs, p); err != nil {
++		return nil, err
++	}
++
++	// Strip out addresses for better merge.
++	if err = p.Aggregate(true, true, true, true, false); err != nil {
++		return nil, err
++	}
++
++	return p, nil
++}
++
++// parseJavaHeader parses the attribute section on a java profile and
++// populates a profile. Returns the remainder of the buffer after all
++// attributes.
++func parseJavaHeader(pType string, b []byte, p *Profile) ([]byte, error) {
++	nextNewLine := bytes.IndexByte(b, byte('\n'))
++	for nextNewLine != -1 {
++		line := string(bytes.TrimSpace(b[0:nextNewLine]))
++		if line != "" {
++			h := attributeRx.FindStringSubmatch(line)
++			if h == nil {
++				// Not a valid attribute, exit.
++				return b, nil
++			}
++
++			attribute, value := strings.TrimSpace(h[1]), strings.TrimSpace(h[2])
++			var err error
++			switch pType + "/" + attribute {
++			case "heap/format", "cpu/format", "contention/format":
++				if value != "java" {
++					return nil, errUnrecognized
++				}
++			case "heap/resolution":
++				p.SampleType = []*ValueType{
++					{Type: "inuse_objects", Unit: "count"},
++					{Type: "inuse_space", Unit: value},
++				}
++			case "contention/resolution":
++				p.SampleType = []*ValueType{
++					{Type: "contentions", Unit: "count"},
++					{Type: "delay", Unit: value},
++				}
++			case "contention/sampling period":
++				p.PeriodType = &ValueType{
++					Type: "contentions", Unit: "count",
++				}
++				if p.Period, err = strconv.ParseInt(value, 0, 64); err != nil {
++					return nil, fmt.Errorf("failed to parse attribute %s: %v", line, err)
++				}
++			case "contention/ms since reset":
++				millis, err := strconv.ParseInt(value, 0, 64)
++				if err != nil {
++					return nil, fmt.Errorf("failed to parse attribute %s: %v", line, err)
++				}
++				p.DurationNanos = millis * 1000 * 1000
++			default:
++				return nil, errUnrecognized
++			}
++		}
++		// Grab next line.
++		b = b[nextNewLine+1:]
++		nextNewLine = bytes.IndexByte(b, byte('\n'))
++	}
++	return b, nil
++}
++
++// parseJavaSamples parses the samples from a java profile and
++// populates the Samples in a profile. Returns the remainder of the
++// buffer after the samples.
++func parseJavaSamples(pType string, b []byte, p *Profile) ([]byte, map[uint64]*Location, error) {
++	nextNewLine := bytes.IndexByte(b, byte('\n'))
++	locs := make(map[uint64]*Location)
++	for nextNewLine != -1 {
++		line := string(bytes.TrimSpace(b[0:nextNewLine]))
++		if line != "" {
++			sample := javaSampleRx.FindStringSubmatch(line)
++			if sample == nil {
++				// Not a valid sample, exit.
++				return b, locs, nil
++			}
++
++			// Java profiles have data/fields inverted compared to other
++			// profile types.
++			var err error
++			value1, value2, value3 := sample[2], sample[1], sample[3]
++			addrs, err := parseHexAddresses(value3)
++			if err != nil {
++				return nil, nil, fmt.Errorf("malformed sample: %s: %v", line, err)
++			}
++
++			var sloc []*Location
++			for _, addr := range addrs {
++				loc := locs[addr]
++				if locs[addr] == nil {
++					loc = &Location{
++						Address: addr,
++					}
++					p.Location = append(p.Location, loc)
++					locs[addr] = loc
++				}
++				sloc = append(sloc, loc)
++			}
++			s := &Sample{
++				Value:    make([]int64, 2),
++				Location: sloc,
++			}
++
++			if s.Value[0], err = strconv.ParseInt(value1, 0, 64); err != nil {
++				return nil, nil, fmt.Errorf("parsing sample %s: %v", line, err)
++			}
++			if s.Value[1], err = strconv.ParseInt(value2, 0, 64); err != nil {
++				return nil, nil, fmt.Errorf("parsing sample %s: %v", line, err)
++			}
++
++			switch pType {
++			case "heap":
++				const javaHeapzSamplingRate = 524288 // 512K
++				if s.Value[0] == 0 {
++					return nil, nil, fmt.Errorf("parsing sample %s: second value must be non-zero", line)
++				}
++				s.NumLabel = map[string][]int64{"bytes": {s.Value[1] / s.Value[0]}}
++				s.Value[0], s.Value[1] = scaleHeapSample(s.Value[0], s.Value[1], javaHeapzSamplingRate)
++			case "contention":
++				if period := p.Period; period != 0 {
++					s.Value[0] = s.Value[0] * p.Period
++					s.Value[1] = s.Value[1] * p.Period
++				}
++			}
++			p.Sample = append(p.Sample, s)
++		}
++		// Grab next line.
++		b = b[nextNewLine+1:]
++		nextNewLine = bytes.IndexByte(b, byte('\n'))
++	}
++	return b, locs, nil
++}
++
++// parseJavaLocations parses the location information in a java
++// profile and populates the Locations in a profile. It uses the
++// location addresses from the profile as both the ID of each
++// location.
++func parseJavaLocations(b []byte, locs map[uint64]*Location, p *Profile) error {
++	r := bytes.NewBuffer(b)
++	fns := make(map[string]*Function)
++	for {
++		line, err := r.ReadString('\n')
++		if err != nil {
++			if err != io.EOF {
++				return err
++			}
++			if line == "" {
++				break
++			}
++		}
++
++		if line = strings.TrimSpace(line); line == "" {
++			continue
++		}
++
++		jloc := javaLocationRx.FindStringSubmatch(line)
++		if len(jloc) != 3 {
++			continue
++		}
++		addr, err := strconv.ParseUint(jloc[1], 16, 64)
++		if err != nil {
++			return fmt.Errorf("parsing sample %s: %v", line, err)
++		}
++		loc := locs[addr]
++		if loc == nil {
++			// Unused/unseen
++			continue
++		}
++		var lineFunc, lineFile string
++		var lineNo int64
++
++		if fileLine := javaLocationFileLineRx.FindStringSubmatch(jloc[2]); len(fileLine) == 4 {
++			// Found a line of the form: "function (file:line)"
++			lineFunc, lineFile = fileLine[1], fileLine[2]
++			if n, err := strconv.ParseInt(fileLine[3], 10, 64); err == nil && n > 0 {
++				lineNo = n
++			}
++		} else if filePath := javaLocationPathRx.FindStringSubmatch(jloc[2]); len(filePath) == 3 {
++			// If there's not a file:line, it's a shared library path.
++			// The path isn't interesting, so just give the .so.
++			lineFunc, lineFile = filePath[1], filepath.Base(filePath[2])
++		} else if strings.Contains(jloc[2], "generated stub/JIT") {
++			lineFunc = "STUB"
++		} else {
++			// Treat whole line as the function name. This is used by the
++			// java agent for internal states such as "GC" or "VM".
++			lineFunc = jloc[2]
++		}
++		fn := fns[lineFunc]
++
++		if fn == nil {
++			fn = &Function{
++				Name:       lineFunc,
++				SystemName: lineFunc,
++				Filename:   lineFile,
++			}
++			fns[lineFunc] = fn
++			p.Function = append(p.Function, fn)
++		}
++		loc.Line = []Line{
++			{
++				Function: fn,
++				Line:     lineNo,
++			},
++		}
++		loc.Address = 0
++	}
++
++	p.remapLocationIDs()
++	p.remapFunctionIDs()
++	p.remapMappingIDs()
++
++	return nil
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/legacy_profile.go b/src/vendor/github_com/google/pprof/profile/legacy_profile.go
+new file mode 100644
+index 0000000000..0c8f3bb5b7
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/legacy_profile.go
+@@ -0,0 +1,1225 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// This file implements parsers to convert legacy profiles into the
++// profile.proto format.
++
++package profile
++
++import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"io"
++	"math"
++	"regexp"
++	"strconv"
++	"strings"
++)
++
++var (
++	countStartRE = regexp.MustCompile(`\A(\S+) profile: total \d+\z`)
++	countRE      = regexp.MustCompile(`\A(\d+) @(( 0x[0-9a-f]+)+)\z`)
++
++	heapHeaderRE = regexp.MustCompile(`heap profile: *(\d+): *(\d+) *\[ *(\d+): *(\d+) *\] *@ *(heap[_a-z0-9]*)/?(\d*)`)
++	heapSampleRE = regexp.MustCompile(`(-?\d+): *(-?\d+) *\[ *(\d+): *(\d+) *] @([ x0-9a-f]*)`)
++
++	contentionSampleRE = regexp.MustCompile(`(\d+) *(\d+) @([ x0-9a-f]*)`)
++
++	hexNumberRE = regexp.MustCompile(`0x[0-9a-f]+`)
++
++	growthHeaderRE = regexp.MustCompile(`heap profile: *(\d+): *(\d+) *\[ *(\d+): *(\d+) *\] @ growthz?`)
++
++	fragmentationHeaderRE = regexp.MustCompile(`heap profile: *(\d+): *(\d+) *\[ *(\d+): *(\d+) *\] @ fragmentationz?`)
++
++	threadzStartRE = regexp.MustCompile(`--- threadz \d+ ---`)
++	threadStartRE  = regexp.MustCompile(`--- Thread ([[:xdigit:]]+) \(name: (.*)/(\d+)\) stack: ---`)
++
++	// Regular expressions to parse process mappings. Support the format used by Linux /proc/.../maps and other tools.
++	// Recommended format:
++	// Start   End     object file name     offset(optional)   linker build id
++	// 0x40000-0x80000 /path/to/binary      (@FF00)            abc123456
++	spaceDigits = `\s+[[:digit:]]+`
++	hexPair     = `\s+[[:xdigit:]]+:[[:xdigit:]]+`
++	oSpace      = `\s*`
++	// Capturing expressions.
++	cHex           = `(?:0x)?([[:xdigit:]]+)`
++	cHexRange      = `\s*` + cHex + `[\s-]?` + oSpace + cHex + `:?`
++	cSpaceString   = `(?:\s+(\S+))?`
++	cSpaceHex      = `(?:\s+([[:xdigit:]]+))?`
++	cSpaceAtOffset = `(?:\s+\(@([[:xdigit:]]+)\))?`
++	cPerm          = `(?:\s+([-rwxp]+))?`
++
++	procMapsRE  = regexp.MustCompile(`^` + cHexRange + cPerm + cSpaceHex + hexPair + spaceDigits + cSpaceString)
++	briefMapsRE = regexp.MustCompile(`^` + cHexRange + cPerm + cSpaceString + cSpaceAtOffset + cSpaceHex)
++
++	// Regular expression to parse log data, of the form:
++	// ... file:line] msg...
++	logInfoRE = regexp.MustCompile(`^[^\[\]]+:[0-9]+]\s`)
++)
++
++func isSpaceOrComment(line string) bool {
++	trimmed := strings.TrimSpace(line)
++	return len(trimmed) == 0 || trimmed[0] == '#'
++}
++
++// parseGoCount parses a Go count profile (e.g., threadcreate or
++// goroutine) and returns a new Profile.
++func parseGoCount(b []byte) (*Profile, error) {
++	s := bufio.NewScanner(bytes.NewBuffer(b))
++	// Skip comments at the beginning of the file.
++	for s.Scan() && isSpaceOrComment(s.Text()) {
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++	m := countStartRE.FindStringSubmatch(s.Text())
++	if m == nil {
++		return nil, errUnrecognized
++	}
++	profileType := m[1]
++	p := &Profile{
++		PeriodType: &ValueType{Type: profileType, Unit: "count"},
++		Period:     1,
++		SampleType: []*ValueType{{Type: profileType, Unit: "count"}},
++	}
++	locations := make(map[uint64]*Location)
++	for s.Scan() {
++		line := s.Text()
++		if isSpaceOrComment(line) {
++			continue
++		}
++		if strings.HasPrefix(line, "---") {
++			break
++		}
++		m := countRE.FindStringSubmatch(line)
++		if m == nil {
++			return nil, errMalformed
++		}
++		n, err := strconv.ParseInt(m[1], 0, 64)
++		if err != nil {
++			return nil, errMalformed
++		}
++		fields := strings.Fields(m[2])
++		locs := make([]*Location, 0, len(fields))
++		for _, stk := range fields {
++			addr, err := strconv.ParseUint(stk, 0, 64)
++			if err != nil {
++				return nil, errMalformed
++			}
++			// Adjust all frames by -1 to land on top of the call instruction.
++			addr--
++			loc := locations[addr]
++			if loc == nil {
++				loc = &Location{
++					Address: addr,
++				}
++				locations[addr] = loc
++				p.Location = append(p.Location, loc)
++			}
++			locs = append(locs, loc)
++		}
++		p.Sample = append(p.Sample, &Sample{
++			Location: locs,
++			Value:    []int64{n},
++		})
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++
++	if err := parseAdditionalSections(s, p); err != nil {
++		return nil, err
++	}
++	return p, nil
++}
++
++// remapLocationIDs ensures there is a location for each address
++// referenced by a sample, and remaps the samples to point to the new
++// location ids.
++func (p *Profile) remapLocationIDs() {
++	seen := make(map[*Location]bool, len(p.Location))
++	var locs []*Location
++
++	for _, s := range p.Sample {
++		for _, l := range s.Location {
++			if seen[l] {
++				continue
++			}
++			l.ID = uint64(len(locs) + 1)
++			locs = append(locs, l)
++			seen[l] = true
++		}
++	}
++	p.Location = locs
++}
++
++func (p *Profile) remapFunctionIDs() {
++	seen := make(map[*Function]bool, len(p.Function))
++	var fns []*Function
++
++	for _, l := range p.Location {
++		for _, ln := range l.Line {
++			fn := ln.Function
++			if fn == nil || seen[fn] {
++				continue
++			}
++			fn.ID = uint64(len(fns) + 1)
++			fns = append(fns, fn)
++			seen[fn] = true
++		}
++	}
++	p.Function = fns
++}
++
++// remapMappingIDs matches location addresses with existing mappings
++// and updates them appropriately. This is O(N*M), if this ever shows
++// up as a bottleneck, evaluate sorting the mappings and doing a
++// binary search, which would make it O(N*log(M)).
++func (p *Profile) remapMappingIDs() {
++	// Some profile handlers will incorrectly set regions for the main
++	// executable if its section is remapped. Fix them through heuristics.
++
++	if len(p.Mapping) > 0 {
++		// Remove the initial mapping if named '/anon_hugepage' and has a
++		// consecutive adjacent mapping.
++		if m := p.Mapping[0]; strings.HasPrefix(m.File, "/anon_hugepage") {
++			if len(p.Mapping) > 1 && m.Limit == p.Mapping[1].Start {
++				p.Mapping = p.Mapping[1:]
++			}
++		}
++	}
++
++	// Subtract the offset from the start of the main mapping if it
++	// ends up at a recognizable start address.
++	if len(p.Mapping) > 0 {
++		const expectedStart = 0x400000
++		if m := p.Mapping[0]; m.Start-m.Offset == expectedStart {
++			m.Start = expectedStart
++			m.Offset = 0
++		}
++	}
++
++	// Associate each location with an address to the corresponding
++	// mapping. Create fake mapping if a suitable one isn't found.
++	var fake *Mapping
++nextLocation:
++	for _, l := range p.Location {
++		a := l.Address
++		if l.Mapping != nil || a == 0 {
++			continue
++		}
++		for _, m := range p.Mapping {
++			if m.Start <= a && a < m.Limit {
++				l.Mapping = m
++				continue nextLocation
++			}
++		}
++		// Work around legacy handlers failing to encode the first
++		// part of mappings split into adjacent ranges.
++		for _, m := range p.Mapping {
++			if m.Offset != 0 && m.Start-m.Offset <= a && a < m.Start {
++				m.Start -= m.Offset
++				m.Offset = 0
++				l.Mapping = m
++				continue nextLocation
++			}
++		}
++		// If there is still no mapping, create a fake one.
++		// This is important for the Go legacy handler, which produced
++		// no mappings.
++		if fake == nil {
++			fake = &Mapping{
++				ID:    1,
++				Limit: ^uint64(0),
++			}
++			p.Mapping = append(p.Mapping, fake)
++		}
++		l.Mapping = fake
++	}
++
++	// Reset all mapping IDs.
++	for i, m := range p.Mapping {
++		m.ID = uint64(i + 1)
++	}
++}
++
++var cpuInts = []func([]byte) (uint64, []byte){
++	get32l,
++	get32b,
++	get64l,
++	get64b,
++}
++
++func get32l(b []byte) (uint64, []byte) {
++	if len(b) < 4 {
++		return 0, nil
++	}
++	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24, b[4:]
++}
++
++func get32b(b []byte) (uint64, []byte) {
++	if len(b) < 4 {
++		return 0, nil
++	}
++	return uint64(b[3]) | uint64(b[2])<<8 | uint64(b[1])<<16 | uint64(b[0])<<24, b[4:]
++}
++
++func get64l(b []byte) (uint64, []byte) {
++	if len(b) < 8 {
++		return 0, nil
++	}
++	return uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 | uint64(b[3])<<24 | uint64(b[4])<<32 | uint64(b[5])<<40 | uint64(b[6])<<48 | uint64(b[7])<<56, b[8:]
++}
++
++func get64b(b []byte) (uint64, []byte) {
++	if len(b) < 8 {
++		return 0, nil
++	}
++	return uint64(b[7]) | uint64(b[6])<<8 | uint64(b[5])<<16 | uint64(b[4])<<24 | uint64(b[3])<<32 | uint64(b[2])<<40 | uint64(b[1])<<48 | uint64(b[0])<<56, b[8:]
++}
++
++// parseCPU parses a profilez legacy profile and returns a newly
++// populated Profile.
++//
++// The general format for profilez samples is a sequence of words in
++// binary format. The first words are a header with the following data:
++//   1st word -- 0
++//   2nd word -- 3
++//   3rd word -- 0 if a c++ application, 1 if a java application.
++//   4th word -- Sampling period (in microseconds).
++//   5th word -- Padding.
++func parseCPU(b []byte) (*Profile, error) {
++	var parse func([]byte) (uint64, []byte)
++	var n1, n2, n3, n4, n5 uint64
++	for _, parse = range cpuInts {
++		var tmp []byte
++		n1, tmp = parse(b)
++		n2, tmp = parse(tmp)
++		n3, tmp = parse(tmp)
++		n4, tmp = parse(tmp)
++		n5, tmp = parse(tmp)
++
++		if tmp != nil && n1 == 0 && n2 == 3 && n3 == 0 && n4 > 0 && n5 == 0 {
++			b = tmp
++			return cpuProfile(b, int64(n4), parse)
++		}
++		if tmp != nil && n1 == 0 && n2 == 3 && n3 == 1 && n4 > 0 && n5 == 0 {
++			b = tmp
++			return javaCPUProfile(b, int64(n4), parse)
++		}
++	}
++	return nil, errUnrecognized
++}
++
++// cpuProfile returns a new Profile from C++ profilez data.
++// b is the profile bytes after the header, period is the profiling
++// period, and parse is a function to parse 8-byte chunks from the
++// profile in its native endianness.
++func cpuProfile(b []byte, period int64, parse func(b []byte) (uint64, []byte)) (*Profile, error) {
++	p := &Profile{
++		Period:     period * 1000,
++		PeriodType: &ValueType{Type: "cpu", Unit: "nanoseconds"},
++		SampleType: []*ValueType{
++			{Type: "samples", Unit: "count"},
++			{Type: "cpu", Unit: "nanoseconds"},
++		},
++	}
++	var err error
++	if b, _, err = parseCPUSamples(b, parse, true, p); err != nil {
++		return nil, err
++	}
++
++	// If *most* samples have the same second-to-the-bottom frame, it
++	// strongly suggests that it is an uninteresting artifact of
++	// measurement -- a stack frame pushed by the signal handler. The
++	// bottom frame is always correct as it is picked up from the signal
++	// structure, not the stack. Check if this is the case and if so,
++	// remove.
++
++	// Remove up to two frames.
++	maxiter := 2
++	// Allow one different sample for this many samples with the same
++	// second-to-last frame.
++	similarSamples := 32
++	margin := len(p.Sample) / similarSamples
++
++	for iter := 0; iter < maxiter; iter++ {
++		addr1 := make(map[uint64]int)
++		for _, s := range p.Sample {
++			if len(s.Location) > 1 {
++				a := s.Location[1].Address
++				addr1[a] = addr1[a] + 1
++			}
++		}
++
++		for id1, count := range addr1 {
++			if count >= len(p.Sample)-margin {
++				// Found uninteresting frame, strip it out from all samples
++				for _, s := range p.Sample {
++					if len(s.Location) > 1 && s.Location[1].Address == id1 {
++						s.Location = append(s.Location[:1], s.Location[2:]...)
++					}
++				}
++				break
++			}
++		}
++	}
++
++	if err := p.ParseMemoryMap(bytes.NewBuffer(b)); err != nil {
++		return nil, err
++	}
++
++	cleanupDuplicateLocations(p)
++	return p, nil
++}
++
++func cleanupDuplicateLocations(p *Profile) {
++	// The profile handler may duplicate the leaf frame, because it gets
++	// its address both from stack unwinding and from the signal
++	// context. Detect this and delete the duplicate, which has been
++	// adjusted by -1. The leaf address should not be adjusted as it is
++	// not a call.
++	for _, s := range p.Sample {
++		if len(s.Location) > 1 && s.Location[0].Address == s.Location[1].Address+1 {
++			s.Location = append(s.Location[:1], s.Location[2:]...)
++		}
++	}
++}
++
++// parseCPUSamples parses a collection of profilez samples from a
++// profile.
++//
++// profilez samples are a repeated sequence of stack frames of the
++// form:
++//    1st word -- The number of times this stack was encountered.
++//    2nd word -- The size of the stack (StackSize).
++//    3rd word -- The first address on the stack.
++//    ...
++//    StackSize + 2 -- The last address on the stack
++// The last stack trace is of the form:
++//   1st word -- 0
++//   2nd word -- 1
++//   3rd word -- 0
++//
++// Addresses from stack traces may point to the next instruction after
++// each call. Optionally adjust by -1 to land somewhere on the actual
++// call (except for the leaf, which is not a call).
++func parseCPUSamples(b []byte, parse func(b []byte) (uint64, []byte), adjust bool, p *Profile) ([]byte, map[uint64]*Location, error) {
++	locs := make(map[uint64]*Location)
++	for len(b) > 0 {
++		var count, nstk uint64
++		count, b = parse(b)
++		nstk, b = parse(b)
++		if b == nil || nstk > uint64(len(b)/4) {
++			return nil, nil, errUnrecognized
++		}
++		var sloc []*Location
++		addrs := make([]uint64, nstk)
++		for i := 0; i < int(nstk); i++ {
++			addrs[i], b = parse(b)
++		}
++
++		if count == 0 && nstk == 1 && addrs[0] == 0 {
++			// End of data marker
++			break
++		}
++		for i, addr := range addrs {
++			if adjust && i > 0 {
++				addr--
++			}
++			loc := locs[addr]
++			if loc == nil {
++				loc = &Location{
++					Address: addr,
++				}
++				locs[addr] = loc
++				p.Location = append(p.Location, loc)
++			}
++			sloc = append(sloc, loc)
++		}
++		p.Sample = append(p.Sample,
++			&Sample{
++				Value:    []int64{int64(count), int64(count) * p.Period},
++				Location: sloc,
++			})
++	}
++	// Reached the end without finding the EOD marker.
++	return b, locs, nil
++}
++
++// parseHeap parses a heapz legacy or a growthz profile and
++// returns a newly populated Profile.
++func parseHeap(b []byte) (p *Profile, err error) {
++	s := bufio.NewScanner(bytes.NewBuffer(b))
++	if !s.Scan() {
++		if err := s.Err(); err != nil {
++			return nil, err
++		}
++		return nil, errUnrecognized
++	}
++	p = &Profile{}
++
++	sampling := ""
++	hasAlloc := false
++
++	line := s.Text()
++	p.PeriodType = &ValueType{Type: "space", Unit: "bytes"}
++	if header := heapHeaderRE.FindStringSubmatch(line); header != nil {
++		sampling, p.Period, hasAlloc, err = parseHeapHeader(line)
++		if err != nil {
++			return nil, err
++		}
++	} else if header = growthHeaderRE.FindStringSubmatch(line); header != nil {
++		p.Period = 1
++	} else if header = fragmentationHeaderRE.FindStringSubmatch(line); header != nil {
++		p.Period = 1
++	} else {
++		return nil, errUnrecognized
++	}
++
++	if hasAlloc {
++		// Put alloc before inuse so that default pprof selection
++		// will prefer inuse_space.
++		p.SampleType = []*ValueType{
++			{Type: "alloc_objects", Unit: "count"},
++			{Type: "alloc_space", Unit: "bytes"},
++			{Type: "inuse_objects", Unit: "count"},
++			{Type: "inuse_space", Unit: "bytes"},
++		}
++	} else {
++		p.SampleType = []*ValueType{
++			{Type: "objects", Unit: "count"},
++			{Type: "space", Unit: "bytes"},
++		}
++	}
++
++	locs := make(map[uint64]*Location)
++	for s.Scan() {
++		line := strings.TrimSpace(s.Text())
++
++		if isSpaceOrComment(line) {
++			continue
++		}
++
++		if isMemoryMapSentinel(line) {
++			break
++		}
++
++		value, blocksize, addrs, err := parseHeapSample(line, p.Period, sampling, hasAlloc)
++		if err != nil {
++			return nil, err
++		}
++
++		var sloc []*Location
++		for _, addr := range addrs {
++			// Addresses from stack traces point to the next instruction after
++			// each call. Adjust by -1 to land somewhere on the actual call.
++			addr--
++			loc := locs[addr]
++			if locs[addr] == nil {
++				loc = &Location{
++					Address: addr,
++				}
++				p.Location = append(p.Location, loc)
++				locs[addr] = loc
++			}
++			sloc = append(sloc, loc)
++		}
++
++		p.Sample = append(p.Sample, &Sample{
++			Value:    value,
++			Location: sloc,
++			NumLabel: map[string][]int64{"bytes": {blocksize}},
++		})
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++	if err := parseAdditionalSections(s, p); err != nil {
++		return nil, err
++	}
++	return p, nil
++}
++
++func parseHeapHeader(line string) (sampling string, period int64, hasAlloc bool, err error) {
++	header := heapHeaderRE.FindStringSubmatch(line)
++	if header == nil {
++		return "", 0, false, errUnrecognized
++	}
++
++	if len(header[6]) > 0 {
++		if period, err = strconv.ParseInt(header[6], 10, 64); err != nil {
++			return "", 0, false, errUnrecognized
++		}
++	}
++
++	if (header[3] != header[1] && header[3] != "0") || (header[4] != header[2] && header[4] != "0") {
++		hasAlloc = true
++	}
++
++	switch header[5] {
++	case "heapz_v2", "heap_v2":
++		return "v2", period, hasAlloc, nil
++	case "heapprofile":
++		return "", 1, hasAlloc, nil
++	case "heap":
++		return "v2", period / 2, hasAlloc, nil
++	default:
++		return "", 0, false, errUnrecognized
++	}
++}
++
++// parseHeapSample parses a single row from a heap profile into a new Sample.
++func parseHeapSample(line string, rate int64, sampling string, includeAlloc bool) (value []int64, blocksize int64, addrs []uint64, err error) {
++	sampleData := heapSampleRE.FindStringSubmatch(line)
++	if len(sampleData) != 6 {
++		return nil, 0, nil, fmt.Errorf("unexpected number of sample values: got %d, want 6", len(sampleData))
++	}
++
++	// This is a local-scoped helper function to avoid needing to pass
++	// around rate, sampling and many return parameters.
++	addValues := func(countString, sizeString string, label string) error {
++		count, err := strconv.ParseInt(countString, 10, 64)
++		if err != nil {
++			return fmt.Errorf("malformed sample: %s: %v", line, err)
++		}
++		size, err := strconv.ParseInt(sizeString, 10, 64)
++		if err != nil {
++			return fmt.Errorf("malformed sample: %s: %v", line, err)
++		}
++		if count == 0 && size != 0 {
++			return fmt.Errorf("%s count was 0 but %s bytes was %d", label, label, size)
++		}
++		if count != 0 {
++			blocksize = size / count
++			if sampling == "v2" {
++				count, size = scaleHeapSample(count, size, rate)
++			}
++		}
++		value = append(value, count, size)
++		return nil
++	}
++
++	if includeAlloc {
++		if err := addValues(sampleData[3], sampleData[4], "allocation"); err != nil {
++			return nil, 0, nil, err
++		}
++	}
++
++	if err := addValues(sampleData[1], sampleData[2], "inuse"); err != nil {
++		return nil, 0, nil, err
++	}
++
++	addrs, err = parseHexAddresses(sampleData[5])
++	if err != nil {
++		return nil, 0, nil, fmt.Errorf("malformed sample: %s: %v", line, err)
++	}
++
++	return value, blocksize, addrs, nil
++}
++
++// parseHexAddresses extracts hex numbers from a string, attempts to convert
++// each to an unsigned 64-bit number and returns the resulting numbers as a
++// slice, or an error if the string contains hex numbers which are too large to
++// handle (which means a malformed profile).
++func parseHexAddresses(s string) ([]uint64, error) {
++	hexStrings := hexNumberRE.FindAllString(s, -1)
++	var addrs []uint64
++	for _, s := range hexStrings {
++		if addr, err := strconv.ParseUint(s, 0, 64); err == nil {
++			addrs = append(addrs, addr)
++		} else {
++			return nil, fmt.Errorf("failed to parse as hex 64-bit number: %s", s)
++		}
++	}
++	return addrs, nil
++}
++
++// scaleHeapSample adjusts the data from a heapz Sample to
++// account for its probability of appearing in the collected
++// data. heapz profiles are a sampling of the memory allocations
++// requests in a program. We estimate the unsampled value by dividing
++// each collected sample by its probability of appearing in the
++// profile. heapz v2 profiles rely on a poisson process to determine
++// which samples to collect, based on the desired average collection
++// rate R. The probability of a sample of size S to appear in that
++// profile is 1-exp(-S/R).
++func scaleHeapSample(count, size, rate int64) (int64, int64) {
++	if count == 0 || size == 0 {
++		return 0, 0
++	}
++
++	if rate <= 1 {
++		// if rate==1 all samples were collected so no adjustment is needed.
++		// if rate<1 treat as unknown and skip scaling.
++		return count, size
++	}
++
++	avgSize := float64(size) / float64(count)
++	scale := 1 / (1 - math.Exp(-avgSize/float64(rate)))
++
++	return int64(float64(count) * scale), int64(float64(size) * scale)
++}
++
++// parseContention parses a mutex or contention profile. There are 2 cases:
++// "--- contentionz " for legacy C++ profiles (and backwards compatibility)
++// "--- mutex:" or "--- contention:" for profiles generated by the Go runtime.
++func parseContention(b []byte) (*Profile, error) {
++	s := bufio.NewScanner(bytes.NewBuffer(b))
++	if !s.Scan() {
++		if err := s.Err(); err != nil {
++			return nil, err
++		}
++		return nil, errUnrecognized
++	}
++
++	switch l := s.Text(); {
++	case strings.HasPrefix(l, "--- contentionz "):
++	case strings.HasPrefix(l, "--- mutex:"):
++	case strings.HasPrefix(l, "--- contention:"):
++	default:
++		return nil, errUnrecognized
++	}
++
++	p := &Profile{
++		PeriodType: &ValueType{Type: "contentions", Unit: "count"},
++		Period:     1,
++		SampleType: []*ValueType{
++			{Type: "contentions", Unit: "count"},
++			{Type: "delay", Unit: "nanoseconds"},
++		},
++	}
++
++	var cpuHz int64
++	// Parse text of the form "attribute = value" before the samples.
++	const delimiter = "="
++	for s.Scan() {
++		line := s.Text()
++		if line = strings.TrimSpace(line); isSpaceOrComment(line) {
++			continue
++		}
++		if strings.HasPrefix(line, "---") {
++			break
++		}
++		attr := strings.SplitN(line, delimiter, 2)
++		if len(attr) != 2 {
++			break
++		}
++		key, val := strings.TrimSpace(attr[0]), strings.TrimSpace(attr[1])
++		var err error
++		switch key {
++		case "cycles/second":
++			if cpuHz, err = strconv.ParseInt(val, 0, 64); err != nil {
++				return nil, errUnrecognized
++			}
++		case "sampling period":
++			if p.Period, err = strconv.ParseInt(val, 0, 64); err != nil {
++				return nil, errUnrecognized
++			}
++		case "ms since reset":
++			ms, err := strconv.ParseInt(val, 0, 64)
++			if err != nil {
++				return nil, errUnrecognized
++			}
++			p.DurationNanos = ms * 1000 * 1000
++		case "format":
++			// CPP contentionz profiles don't have format.
++			return nil, errUnrecognized
++		case "resolution":
++			// CPP contentionz profiles don't have resolution.
++			return nil, errUnrecognized
++		case "discarded samples":
++		default:
++			return nil, errUnrecognized
++		}
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++
++	locs := make(map[uint64]*Location)
++	for {
++		line := strings.TrimSpace(s.Text())
++		if strings.HasPrefix(line, "---") {
++			break
++		}
++		if !isSpaceOrComment(line) {
++			value, addrs, err := parseContentionSample(line, p.Period, cpuHz)
++			if err != nil {
++				return nil, err
++			}
++			var sloc []*Location
++			for _, addr := range addrs {
++				// Addresses from stack traces point to the next instruction after
++				// each call. Adjust by -1 to land somewhere on the actual call.
++				addr--
++				loc := locs[addr]
++				if locs[addr] == nil {
++					loc = &Location{
++						Address: addr,
++					}
++					p.Location = append(p.Location, loc)
++					locs[addr] = loc
++				}
++				sloc = append(sloc, loc)
++			}
++			p.Sample = append(p.Sample, &Sample{
++				Value:    value,
++				Location: sloc,
++			})
++		}
++		if !s.Scan() {
++			break
++		}
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++
++	if err := parseAdditionalSections(s, p); err != nil {
++		return nil, err
++	}
++
++	return p, nil
++}
++
++// parseContentionSample parses a single row from a contention profile
++// into a new Sample.
++func parseContentionSample(line string, period, cpuHz int64) (value []int64, addrs []uint64, err error) {
++	sampleData := contentionSampleRE.FindStringSubmatch(line)
++	if sampleData == nil {
++		return nil, nil, errUnrecognized
++	}
++
++	v1, err := strconv.ParseInt(sampleData[1], 10, 64)
++	if err != nil {
++		return nil, nil, fmt.Errorf("malformed sample: %s: %v", line, err)
++	}
++	v2, err := strconv.ParseInt(sampleData[2], 10, 64)
++	if err != nil {
++		return nil, nil, fmt.Errorf("malformed sample: %s: %v", line, err)
++	}
++
++	// Unsample values if period and cpuHz are available.
++	// - Delays are scaled to cycles and then to nanoseconds.
++	// - Contentions are scaled to cycles.
++	if period > 0 {
++		if cpuHz > 0 {
++			cpuGHz := float64(cpuHz) / 1e9
++			v1 = int64(float64(v1) * float64(period) / cpuGHz)
++		}
++		v2 = v2 * period
++	}
++
++	value = []int64{v2, v1}
++	addrs, err = parseHexAddresses(sampleData[3])
++	if err != nil {
++		return nil, nil, fmt.Errorf("malformed sample: %s: %v", line, err)
++	}
++
++	return value, addrs, nil
++}
++
++// parseThread parses a Threadz profile and returns a new Profile.
++func parseThread(b []byte) (*Profile, error) {
++	s := bufio.NewScanner(bytes.NewBuffer(b))
++	// Skip past comments and empty lines seeking a real header.
++	for s.Scan() && isSpaceOrComment(s.Text()) {
++	}
++
++	line := s.Text()
++	if m := threadzStartRE.FindStringSubmatch(line); m != nil {
++		// Advance over initial comments until first stack trace.
++		for s.Scan() {
++			if line = s.Text(); isMemoryMapSentinel(line) || strings.HasPrefix(line, "-") {
++				break
++			}
++		}
++	} else if t := threadStartRE.FindStringSubmatch(line); len(t) != 4 {
++		return nil, errUnrecognized
++	}
++
++	p := &Profile{
++		SampleType: []*ValueType{{Type: "thread", Unit: "count"}},
++		PeriodType: &ValueType{Type: "thread", Unit: "count"},
++		Period:     1,
++	}
++
++	locs := make(map[uint64]*Location)
++	// Recognize each thread and populate profile samples.
++	for !isMemoryMapSentinel(line) {
++		if strings.HasPrefix(line, "---- no stack trace for") {
++			line = ""
++			break
++		}
++		if t := threadStartRE.FindStringSubmatch(line); len(t) != 4 {
++			return nil, errUnrecognized
++		}
++
++		var addrs []uint64
++		var err error
++		line, addrs, err = parseThreadSample(s)
++		if err != nil {
++			return nil, err
++		}
++		if len(addrs) == 0 {
++			// We got a --same as previous threads--. Bump counters.
++			if len(p.Sample) > 0 {
++				s := p.Sample[len(p.Sample)-1]
++				s.Value[0]++
++			}
++			continue
++		}
++
++		var sloc []*Location
++		for i, addr := range addrs {
++			// Addresses from stack traces point to the next instruction after
++			// each call. Adjust by -1 to land somewhere on the actual call
++			// (except for the leaf, which is not a call).
++			if i > 0 {
++				addr--
++			}
++			loc := locs[addr]
++			if locs[addr] == nil {
++				loc = &Location{
++					Address: addr,
++				}
++				p.Location = append(p.Location, loc)
++				locs[addr] = loc
++			}
++			sloc = append(sloc, loc)
++		}
++
++		p.Sample = append(p.Sample, &Sample{
++			Value:    []int64{1},
++			Location: sloc,
++		})
++	}
++
++	if err := parseAdditionalSections(s, p); err != nil {
++		return nil, err
++	}
++
++	cleanupDuplicateLocations(p)
++	return p, nil
++}
++
++// parseThreadSample parses a symbolized or unsymbolized stack trace.
++// Returns the first line after the traceback, the sample (or nil if
++// it hits a 'same-as-previous' marker) and an error.
++func parseThreadSample(s *bufio.Scanner) (nextl string, addrs []uint64, err error) {
++	var line string
++	sameAsPrevious := false
++	for s.Scan() {
++		line = strings.TrimSpace(s.Text())
++		if line == "" {
++			continue
++		}
++
++		if strings.HasPrefix(line, "---") {
++			break
++		}
++		if strings.Contains(line, "same as previous thread") {
++			sameAsPrevious = true
++			continue
++		}
++
++		curAddrs, err := parseHexAddresses(line)
++		if err != nil {
++			return "", nil, fmt.Errorf("malformed sample: %s: %v", line, err)
++		}
++		addrs = append(addrs, curAddrs...)
++	}
++	if err := s.Err(); err != nil {
++		return "", nil, err
++	}
++	if sameAsPrevious {
++		return line, nil, nil
++	}
++	return line, addrs, nil
++}
++
++// parseAdditionalSections parses any additional sections in the
++// profile, ignoring any unrecognized sections.
++func parseAdditionalSections(s *bufio.Scanner, p *Profile) error {
++	for !isMemoryMapSentinel(s.Text()) && s.Scan() {
++	}
++	if err := s.Err(); err != nil {
++		return err
++	}
++	return p.ParseMemoryMapFromScanner(s)
++}
++
++// ParseProcMaps parses a memory map in the format of /proc/self/maps.
++// ParseMemoryMap should be called after setting on a profile to
++// associate locations to the corresponding mapping based on their
++// address.
++func ParseProcMaps(rd io.Reader) ([]*Mapping, error) {
++	s := bufio.NewScanner(rd)
++	return parseProcMapsFromScanner(s)
++}
++
++func parseProcMapsFromScanner(s *bufio.Scanner) ([]*Mapping, error) {
++	var mapping []*Mapping
++
++	var attrs []string
++	const delimiter = "="
++	r := strings.NewReplacer()
++	for s.Scan() {
++		line := r.Replace(removeLoggingInfo(s.Text()))
++		m, err := parseMappingEntry(line)
++		if err != nil {
++			if err == errUnrecognized {
++				// Recognize assignments of the form: attr=value, and replace
++				// $attr with value on subsequent mappings.
++				if attr := strings.SplitN(line, delimiter, 2); len(attr) == 2 {
++					attrs = append(attrs, "$"+strings.TrimSpace(attr[0]), strings.TrimSpace(attr[1]))
++					r = strings.NewReplacer(attrs...)
++				}
++				// Ignore any unrecognized entries
++				continue
++			}
++			return nil, err
++		}
++		if m == nil {
++			continue
++		}
++		mapping = append(mapping, m)
++	}
++	if err := s.Err(); err != nil {
++		return nil, err
++	}
++	return mapping, nil
++}
++
++// removeLoggingInfo detects and removes log prefix entries generated
++// by the glog package. If no logging prefix is detected, the string
++// is returned unmodified.
++func removeLoggingInfo(line string) string {
++	if match := logInfoRE.FindStringIndex(line); match != nil {
++		return line[match[1]:]
++	}
++	return line
++}
++
++// ParseMemoryMap parses a memory map in the format of
++// /proc/self/maps, and overrides the mappings in the current profile.
++// It renumbers the samples and locations in the profile correspondingly.
++func (p *Profile) ParseMemoryMap(rd io.Reader) error {
++	return p.ParseMemoryMapFromScanner(bufio.NewScanner(rd))
++}
++
++// ParseMemoryMapFromScanner parses a memory map in the format of
++// /proc/self/maps or a variety of legacy format, and overrides the
++// mappings in the current profile.  It renumbers the samples and
++// locations in the profile correspondingly.
++func (p *Profile) ParseMemoryMapFromScanner(s *bufio.Scanner) error {
++	mapping, err := parseProcMapsFromScanner(s)
++	if err != nil {
++		return err
++	}
++	p.Mapping = append(p.Mapping, mapping...)
++	p.massageMappings()
++	p.remapLocationIDs()
++	p.remapFunctionIDs()
++	p.remapMappingIDs()
++	return nil
++}
++
++func parseMappingEntry(l string) (*Mapping, error) {
++	var start, end, perm, file, offset, buildID string
++	if me := procMapsRE.FindStringSubmatch(l); len(me) == 6 {
++		start, end, perm, offset, file = me[1], me[2], me[3], me[4], me[5]
++	} else if me := briefMapsRE.FindStringSubmatch(l); len(me) == 7 {
++		start, end, perm, file, offset, buildID = me[1], me[2], me[3], me[4], me[5], me[6]
++	} else {
++		return nil, errUnrecognized
++	}
++
++	var err error
++	mapping := &Mapping{
++		File:    file,
++		BuildID: buildID,
++	}
++	if perm != "" && !strings.Contains(perm, "x") {
++		// Skip non-executable entries.
++		return nil, nil
++	}
++	if mapping.Start, err = strconv.ParseUint(start, 16, 64); err != nil {
++		return nil, errUnrecognized
++	}
++	if mapping.Limit, err = strconv.ParseUint(end, 16, 64); err != nil {
++		return nil, errUnrecognized
++	}
++	if offset != "" {
++		if mapping.Offset, err = strconv.ParseUint(offset, 16, 64); err != nil {
++			return nil, errUnrecognized
++		}
++	}
++	return mapping, nil
++}
++
++var memoryMapSentinels = []string{
++	"--- Memory map: ---",
++	"MAPPED_LIBRARIES:",
++}
++
++// isMemoryMapSentinel returns true if the string contains one of the
++// known sentinels for memory map information.
++func isMemoryMapSentinel(line string) bool {
++	for _, s := range memoryMapSentinels {
++		if strings.Contains(line, s) {
++			return true
++		}
++	}
++	return false
++}
++
++func (p *Profile) addLegacyFrameInfo() {
++	switch {
++	case isProfileType(p, heapzSampleTypes):
++		p.DropFrames, p.KeepFrames = allocRxStr, allocSkipRxStr
++	case isProfileType(p, contentionzSampleTypes):
++		p.DropFrames, p.KeepFrames = lockRxStr, ""
++	default:
++		p.DropFrames, p.KeepFrames = cpuProfilerRxStr, ""
++	}
++}
++
++var heapzSampleTypes = [][]string{
++	{"allocations", "size"}, // early Go pprof profiles
++	{"objects", "space"},
++	{"inuse_objects", "inuse_space"},
++	{"alloc_objects", "alloc_space"},
++	{"alloc_objects", "alloc_space", "inuse_objects", "inuse_space"}, // Go pprof legacy profiles
++}
++var contentionzSampleTypes = [][]string{
++	{"contentions", "delay"},
++}
++
++func isProfileType(p *Profile, types [][]string) bool {
++	st := p.SampleType
++nextType:
++	for _, t := range types {
++		if len(st) != len(t) {
++			continue
++		}
++
++		for i := range st {
++			if st[i].Type != t[i] {
++				continue nextType
++			}
++		}
++		return true
++	}
++	return false
++}
++
++var allocRxStr = strings.Join([]string{
++	// POSIX entry points.
++	`calloc`,
++	`cfree`,
++	`malloc`,
++	`free`,
++	`memalign`,
++	`do_memalign`,
++	`(__)?posix_memalign`,
++	`pvalloc`,
++	`valloc`,
++	`realloc`,
++
++	// TC malloc.
++	`tcmalloc::.*`,
++	`tc_calloc`,
++	`tc_cfree`,
++	`tc_malloc`,
++	`tc_free`,
++	`tc_memalign`,
++	`tc_posix_memalign`,
++	`tc_pvalloc`,
++	`tc_valloc`,
++	`tc_realloc`,
++	`tc_new`,
++	`tc_delete`,
++	`tc_newarray`,
++	`tc_deletearray`,
++	`tc_new_nothrow`,
++	`tc_newarray_nothrow`,
++
++	// Memory-allocation routines on OS X.
++	`malloc_zone_malloc`,
++	`malloc_zone_calloc`,
++	`malloc_zone_valloc`,
++	`malloc_zone_realloc`,
++	`malloc_zone_memalign`,
++	`malloc_zone_free`,
++
++	// Go runtime
++	`runtime\..*`,
++
++	// Other misc. memory allocation routines
++	`BaseArena::.*`,
++	`(::)?do_malloc_no_errno`,
++	`(::)?do_malloc_pages`,
++	`(::)?do_malloc`,
++	`DoSampledAllocation`,
++	`MallocedMemBlock::MallocedMemBlock`,
++	`_M_allocate`,
++	`__builtin_(vec_)?delete`,
++	`__builtin_(vec_)?new`,
++	`__gnu_cxx::new_allocator::allocate`,
++	`__libc_malloc`,
++	`__malloc_alloc_template::allocate`,
++	`allocate`,
++	`cpp_alloc`,
++	`operator new(\[\])?`,
++	`simple_alloc::allocate`,
++}, `|`)
++
++var allocSkipRxStr = strings.Join([]string{
++	// Preserve Go runtime frames that appear in the middle/bottom of
++	// the stack.
++	`runtime\.panic`,
++	`runtime\.reflectcall`,
++	`runtime\.call[0-9]*`,
++}, `|`)
++
++var cpuProfilerRxStr = strings.Join([]string{
++	`ProfileData::Add`,
++	`ProfileData::prof_handler`,
++	`CpuProfiler::prof_handler`,
++	`__pthread_sighandler`,
++	`__restore`,
++}, `|`)
++
++var lockRxStr = strings.Join([]string{
++	`RecordLockProfileData`,
++	`(base::)?RecordLockProfileData.*`,
++	`(base::)?SubmitMutexProfileData.*`,
++	`(base::)?SubmitSpinLockProfileData.*`,
++	`(base::Mutex::)?AwaitCommon.*`,
++	`(base::Mutex::)?Unlock.*`,
++	`(base::Mutex::)?UnlockSlow.*`,
++	`(base::Mutex::)?ReaderUnlock.*`,
++	`(base::MutexLock::)?~MutexLock.*`,
++	`(Mutex::)?AwaitCommon.*`,
++	`(Mutex::)?Unlock.*`,
++	`(Mutex::)?UnlockSlow.*`,
++	`(Mutex::)?ReaderUnlock.*`,
++	`(MutexLock::)?~MutexLock.*`,
++	`(SpinLock::)?Unlock.*`,
++	`(SpinLock::)?SlowUnlock.*`,
++	`(SpinLockHolder::)?~SpinLockHolder.*`,
++}, `|`)
+diff --git a/src/vendor/github_com/google/pprof/profile/merge.go b/src/vendor/github_com/google/pprof/profile/merge.go
+new file mode 100644
+index 0000000000..4dcc27f48e
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/merge.go
+@@ -0,0 +1,479 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package profile
++
++import (
++	"fmt"
++	"sort"
++	"strconv"
++	"strings"
++)
++
++// Compact performs garbage collection on a profile to remove any
++// unreferenced fields. This is useful to reduce the size of a profile
++// after samples or locations have been removed.
++func (p *Profile) Compact() *Profile {
++	p, _ = Merge([]*Profile{p})
++	return p
++}
++
++// Merge merges all the profiles in profs into a single Profile.
++// Returns a new profile independent of the input profiles. The merged
++// profile is compacted to eliminate unused samples, locations,
++// functions and mappings. Profiles must have identical profile sample
++// and period types or the merge will fail. profile.Period of the
++// resulting profile will be the maximum of all profiles, and
++// profile.TimeNanos will be the earliest nonzero one.
++func Merge(srcs []*Profile) (*Profile, error) {
++	if len(srcs) == 0 {
++		return nil, fmt.Errorf("no profiles to merge")
++	}
++	p, err := combineHeaders(srcs)
++	if err != nil {
++		return nil, err
++	}
++
++	pm := &profileMerger{
++		p:         p,
++		samples:   make(map[sampleKey]*Sample, len(srcs[0].Sample)),
++		locations: make(map[locationKey]*Location, len(srcs[0].Location)),
++		functions: make(map[functionKey]*Function, len(srcs[0].Function)),
++		mappings:  make(map[mappingKey]*Mapping, len(srcs[0].Mapping)),
++	}
++
++	for _, src := range srcs {
++		// Clear the profile-specific hash tables
++		pm.locationsByID = make(map[uint64]*Location, len(src.Location))
++		pm.functionsByID = make(map[uint64]*Function, len(src.Function))
++		pm.mappingsByID = make(map[uint64]mapInfo, len(src.Mapping))
++
++		if len(pm.mappings) == 0 && len(src.Mapping) > 0 {
++			// The Mapping list has the property that the first mapping
++			// represents the main binary. Take the first Mapping we see,
++			// otherwise the operations below will add mappings in an
++			// arbitrary order.
++			pm.mapMapping(src.Mapping[0])
++		}
++
++		for _, s := range src.Sample {
++			if !isZeroSample(s) {
++				pm.mapSample(s)
++			}
++		}
++	}
++
++	for _, s := range p.Sample {
++		if isZeroSample(s) {
++			// If there are any zero samples, re-merge the profile to GC
++			// them.
++			return Merge([]*Profile{p})
++		}
++	}
++
++	return p, nil
++}
++
++// Normalize normalizes the source profile by multiplying each value in profile by the
++// ratio of the sum of the base profile's values of that sample type to the sum of the
++// source profile's value of that sample type.
++func (p *Profile) Normalize(pb *Profile) error {
++
++	if err := p.compatible(pb); err != nil {
++		return err
++	}
++
++	baseVals := make([]int64, len(p.SampleType))
++	for _, s := range pb.Sample {
++		for i, v := range s.Value {
++			baseVals[i] += v
++		}
++	}
++
++	srcVals := make([]int64, len(p.SampleType))
++	for _, s := range p.Sample {
++		for i, v := range s.Value {
++			srcVals[i] += v
++		}
++	}
++
++	normScale := make([]float64, len(baseVals))
++	for i := range baseVals {
++		if srcVals[i] == 0 {
++			normScale[i] = 0.0
++		} else {
++			normScale[i] = float64(baseVals[i]) / float64(srcVals[i])
++		}
++	}
++	p.ScaleN(normScale)
++	return nil
++}
++
++func isZeroSample(s *Sample) bool {
++	for _, v := range s.Value {
++		if v != 0 {
++			return false
++		}
++	}
++	return true
++}
++
++type profileMerger struct {
++	p *Profile
++
++	// Memoization tables within a profile.
++	locationsByID map[uint64]*Location
++	functionsByID map[uint64]*Function
++	mappingsByID  map[uint64]mapInfo
++
++	// Memoization tables for profile entities.
++	samples   map[sampleKey]*Sample
++	locations map[locationKey]*Location
++	functions map[functionKey]*Function
++	mappings  map[mappingKey]*Mapping
++}
++
++type mapInfo struct {
++	m      *Mapping
++	offset int64
++}
++
++func (pm *profileMerger) mapSample(src *Sample) *Sample {
++	s := &Sample{
++		Location: make([]*Location, len(src.Location)),
++		Value:    make([]int64, len(src.Value)),
++		Label:    make(map[string][]string, len(src.Label)),
++		NumLabel: make(map[string][]int64, len(src.NumLabel)),
++		NumUnit:  make(map[string][]string, len(src.NumLabel)),
++	}
++	for i, l := range src.Location {
++		s.Location[i] = pm.mapLocation(l)
++	}
++	for k, v := range src.Label {
++		vv := make([]string, len(v))
++		copy(vv, v)
++		s.Label[k] = vv
++	}
++	for k, v := range src.NumLabel {
++		u := src.NumUnit[k]
++		vv := make([]int64, len(v))
++		uu := make([]string, len(u))
++		copy(vv, v)
++		copy(uu, u)
++		s.NumLabel[k] = vv
++		s.NumUnit[k] = uu
++	}
++	// Check memoization table. Must be done on the remapped location to
++	// account for the remapped mapping. Add current values to the
++	// existing sample.
++	k := s.key()
++	if ss, ok := pm.samples[k]; ok {
++		for i, v := range src.Value {
++			ss.Value[i] += v
++		}
++		return ss
++	}
++	copy(s.Value, src.Value)
++	pm.samples[k] = s
++	pm.p.Sample = append(pm.p.Sample, s)
++	return s
++}
++
++// key generates sampleKey to be used as a key for maps.
++func (sample *Sample) key() sampleKey {
++	ids := make([]string, len(sample.Location))
++	for i, l := range sample.Location {
++		ids[i] = strconv.FormatUint(l.ID, 16)
++	}
++
++	labels := make([]string, 0, len(sample.Label))
++	for k, v := range sample.Label {
++		labels = append(labels, fmt.Sprintf("%q%q", k, v))
++	}
++	sort.Strings(labels)
++
++	numlabels := make([]string, 0, len(sample.NumLabel))
++	for k, v := range sample.NumLabel {
++		numlabels = append(numlabels, fmt.Sprintf("%q%x%x", k, v, sample.NumUnit[k]))
++	}
++	sort.Strings(numlabels)
++
++	return sampleKey{
++		strings.Join(ids, "|"),
++		strings.Join(labels, ""),
++		strings.Join(numlabels, ""),
++	}
++}
++
++type sampleKey struct {
++	locations string
++	labels    string
++	numlabels string
++}
++
++func (pm *profileMerger) mapLocation(src *Location) *Location {
++	if src == nil {
++		return nil
++	}
++
++	if l, ok := pm.locationsByID[src.ID]; ok {
++		pm.locationsByID[src.ID] = l
++		return l
++	}
++
++	mi := pm.mapMapping(src.Mapping)
++	l := &Location{
++		ID:       uint64(len(pm.p.Location) + 1),
++		Mapping:  mi.m,
++		Address:  uint64(int64(src.Address) + mi.offset),
++		Line:     make([]Line, len(src.Line)),
++		IsFolded: src.IsFolded,
++	}
++	for i, ln := range src.Line {
++		l.Line[i] = pm.mapLine(ln)
++	}
++	// Check memoization table. Must be done on the remapped location to
++	// account for the remapped mapping ID.
++	k := l.key()
++	if ll, ok := pm.locations[k]; ok {
++		pm.locationsByID[src.ID] = ll
++		return ll
++	}
++	pm.locationsByID[src.ID] = l
++	pm.locations[k] = l
++	pm.p.Location = append(pm.p.Location, l)
++	return l
++}
++
++// key generates locationKey to be used as a key for maps.
++func (l *Location) key() locationKey {
++	key := locationKey{
++		addr:     l.Address,
++		isFolded: l.IsFolded,
++	}
++	if l.Mapping != nil {
++		// Normalizes address to handle address space randomization.
++		key.addr -= l.Mapping.Start
++		key.mappingID = l.Mapping.ID
++	}
++	lines := make([]string, len(l.Line)*2)
++	for i, line := range l.Line {
++		if line.Function != nil {
++			lines[i*2] = strconv.FormatUint(line.Function.ID, 16)
++		}
++		lines[i*2+1] = strconv.FormatInt(line.Line, 16)
++	}
++	key.lines = strings.Join(lines, "|")
++	return key
++}
++
++type locationKey struct {
++	addr, mappingID uint64
++	lines           string
++	isFolded        bool
++}
++
++func (pm *profileMerger) mapMapping(src *Mapping) mapInfo {
++	if src == nil {
++		return mapInfo{}
++	}
++
++	if mi, ok := pm.mappingsByID[src.ID]; ok {
++		return mi
++	}
++
++	// Check memoization tables.
++	mk := src.key()
++	if m, ok := pm.mappings[mk]; ok {
++		mi := mapInfo{m, int64(m.Start) - int64(src.Start)}
++		pm.mappingsByID[src.ID] = mi
++		return mi
++	}
++	m := &Mapping{
++		ID:              uint64(len(pm.p.Mapping) + 1),
++		Start:           src.Start,
++		Limit:           src.Limit,
++		Offset:          src.Offset,
++		File:            src.File,
++		BuildID:         src.BuildID,
++		HasFunctions:    src.HasFunctions,
++		HasFilenames:    src.HasFilenames,
++		HasLineNumbers:  src.HasLineNumbers,
++		HasInlineFrames: src.HasInlineFrames,
++	}
++	pm.p.Mapping = append(pm.p.Mapping, m)
++
++	// Update memoization tables.
++	pm.mappings[mk] = m
++	mi := mapInfo{m, 0}
++	pm.mappingsByID[src.ID] = mi
++	return mi
++}
++
++// key generates encoded strings of Mapping to be used as a key for
++// maps.
++func (m *Mapping) key() mappingKey {
++	// Normalize addresses to handle address space randomization.
++	// Round up to next 4K boundary to avoid minor discrepancies.
++	const mapsizeRounding = 0x1000
++
++	size := m.Limit - m.Start
++	size = size + mapsizeRounding - 1
++	size = size - (size % mapsizeRounding)
++	key := mappingKey{
++		size:   size,
++		offset: m.Offset,
++	}
++
++	switch {
++	case m.BuildID != "":
++		key.buildIDOrFile = m.BuildID
++	case m.File != "":
++		key.buildIDOrFile = m.File
++	default:
++		// A mapping containing neither build ID nor file name is a fake mapping. A
++		// key with empty buildIDOrFile is used for fake mappings so that they are
++		// treated as the same mapping during merging.
++	}
++	return key
++}
++
++type mappingKey struct {
++	size, offset  uint64
++	buildIDOrFile string
++}
++
++func (pm *profileMerger) mapLine(src Line) Line {
++	ln := Line{
++		Function: pm.mapFunction(src.Function),
++		Line:     src.Line,
++	}
++	return ln
++}
++
++func (pm *profileMerger) mapFunction(src *Function) *Function {
++	if src == nil {
++		return nil
++	}
++	if f, ok := pm.functionsByID[src.ID]; ok {
++		return f
++	}
++	k := src.key()
++	if f, ok := pm.functions[k]; ok {
++		pm.functionsByID[src.ID] = f
++		return f
++	}
++	f := &Function{
++		ID:         uint64(len(pm.p.Function) + 1),
++		Name:       src.Name,
++		SystemName: src.SystemName,
++		Filename:   src.Filename,
++		StartLine:  src.StartLine,
++	}
++	pm.functions[k] = f
++	pm.functionsByID[src.ID] = f
++	pm.p.Function = append(pm.p.Function, f)
++	return f
++}
++
++// key generates a struct to be used as a key for maps.
++func (f *Function) key() functionKey {
++	return functionKey{
++		f.StartLine,
++		f.Name,
++		f.SystemName,
++		f.Filename,
++	}
++}
++
++type functionKey struct {
++	startLine                  int64
++	name, systemName, fileName string
++}
++
++// combineHeaders checks that all profiles can be merged and returns
++// their combined profile.
++func combineHeaders(srcs []*Profile) (*Profile, error) {
++	for _, s := range srcs[1:] {
++		if err := srcs[0].compatible(s); err != nil {
++			return nil, err
++		}
++	}
++
++	var timeNanos, durationNanos, period int64
++	var comments []string
++	seenComments := map[string]bool{}
++	var defaultSampleType string
++	for _, s := range srcs {
++		if timeNanos == 0 || s.TimeNanos < timeNanos {
++			timeNanos = s.TimeNanos
++		}
++		durationNanos += s.DurationNanos
++		if period == 0 || period < s.Period {
++			period = s.Period
++		}
++		for _, c := range s.Comments {
++			if seen := seenComments[c]; !seen {
++				comments = append(comments, c)
++				seenComments[c] = true
++			}
++		}
++		if defaultSampleType == "" {
++			defaultSampleType = s.DefaultSampleType
++		}
++	}
++
++	p := &Profile{
++		SampleType: make([]*ValueType, len(srcs[0].SampleType)),
++
++		DropFrames: srcs[0].DropFrames,
++		KeepFrames: srcs[0].KeepFrames,
++
++		TimeNanos:     timeNanos,
++		DurationNanos: durationNanos,
++		PeriodType:    srcs[0].PeriodType,
++		Period:        period,
++
++		Comments:          comments,
++		DefaultSampleType: defaultSampleType,
++	}
++	copy(p.SampleType, srcs[0].SampleType)
++	return p, nil
++}
++
++// compatible determines if two profiles can be compared/merged.
++// returns nil if the profiles are compatible; otherwise an error with
++// details on the incompatibility.
++func (p *Profile) compatible(pb *Profile) error {
++	if !equalValueType(p.PeriodType, pb.PeriodType) {
++		return fmt.Errorf("incompatible period types %v and %v", p.PeriodType, pb.PeriodType)
++	}
++
++	if len(p.SampleType) != len(pb.SampleType) {
++		return fmt.Errorf("incompatible sample types %v and %v", p.SampleType, pb.SampleType)
++	}
++
++	for i := range p.SampleType {
++		if !equalValueType(p.SampleType[i], pb.SampleType[i]) {
++			return fmt.Errorf("incompatible sample types %v and %v", p.SampleType, pb.SampleType)
++		}
++	}
++	return nil
++}
++
++// equalValueType returns true if the two value types are semantically
++// equal. It ignores the internal fields used during encode/decode.
++func equalValueType(st1, st2 *ValueType) bool {
++	return st1.Type == st2.Type && st1.Unit == st2.Unit
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/profile.go b/src/vendor/github_com/google/pprof/profile/profile.go
+new file mode 100644
+index 0000000000..5eb1cc1614
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/profile.go
+@@ -0,0 +1,791 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Package profile provides a representation of profile.proto and
++// methods to encode/decode profiles in this format.
++package profile
++
++import (
++	"bytes"
++	"compress/gzip"
++	"fmt"
++	"io"
++	"io/ioutil"
++	"path/filepath"
++	"regexp"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++)
++
++// Profile is an in-memory representation of profile.proto.
++type Profile struct {
++	SampleType        []*ValueType
++	DefaultSampleType string
++	Sample            []*Sample
++	Mapping           []*Mapping
++	Location          []*Location
++	Function          []*Function
++	Comments          []string
++
++	DropFrames string
++	KeepFrames string
++
++	TimeNanos     int64
++	DurationNanos int64
++	PeriodType    *ValueType
++	Period        int64
++
++	// The following fields are modified during encoding and copying,
++	// so are protected by a Mutex.
++	encodeMu sync.Mutex
++
++	commentX           []int64
++	dropFramesX        int64
++	keepFramesX        int64
++	stringTable        []string
++	defaultSampleTypeX int64
++}
++
++// ValueType corresponds to Profile.ValueType
++type ValueType struct {
++	Type string // cpu, wall, inuse_space, etc
++	Unit string // seconds, nanoseconds, bytes, etc
++
++	typeX int64
++	unitX int64
++}
++
++// Sample corresponds to Profile.Sample
++type Sample struct {
++	Location []*Location
++	Value    []int64
++	Label    map[string][]string
++	NumLabel map[string][]int64
++	NumUnit  map[string][]string
++
++	locationIDX []uint64
++	labelX      []label
++}
++
++// label corresponds to Profile.Label
++type label struct {
++	keyX int64
++	// Exactly one of the two following values must be set
++	strX int64
++	numX int64 // Integer value for this label
++	// can be set if numX has value
++	unitX int64
++}
++
++// Mapping corresponds to Profile.Mapping
++type Mapping struct {
++	ID              uint64
++	Start           uint64
++	Limit           uint64
++	Offset          uint64
++	File            string
++	BuildID         string
++	HasFunctions    bool
++	HasFilenames    bool
++	HasLineNumbers  bool
++	HasInlineFrames bool
++
++	fileX    int64
++	buildIDX int64
++}
++
++// Location corresponds to Profile.Location
++type Location struct {
++	ID       uint64
++	Mapping  *Mapping
++	Address  uint64
++	Line     []Line
++	IsFolded bool
++
++	mappingIDX uint64
++}
++
++// Line corresponds to Profile.Line
++type Line struct {
++	Function *Function
++	Line     int64
++
++	functionIDX uint64
++}
++
++// Function corresponds to Profile.Function
++type Function struct {
++	ID         uint64
++	Name       string
++	SystemName string
++	Filename   string
++	StartLine  int64
++
++	nameX       int64
++	systemNameX int64
++	filenameX   int64
++}
++
++// Parse parses a profile and checks for its validity. The input
++// may be a gzip-compressed encoded protobuf or one of many legacy
++// profile formats which may be unsupported in the future.
++func Parse(r io.Reader) (*Profile, error) {
++	data, err := ioutil.ReadAll(r)
++	if err != nil {
++		return nil, err
++	}
++	return ParseData(data)
++}
++
++// ParseData parses a profile from a buffer and checks for its
++// validity.
++func ParseData(data []byte) (*Profile, error) {
++	var p *Profile
++	var err error
++	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
++		gz, err := gzip.NewReader(bytes.NewBuffer(data))
++		if err == nil {
++			data, err = ioutil.ReadAll(gz)
++		}
++		if err != nil {
++			return nil, fmt.Errorf("decompressing profile: %v", err)
++		}
++	}
++	if p, err = ParseUncompressed(data); err != nil && err != errNoData && err != errConcatProfile {
++		p, err = parseLegacy(data)
++	}
++
++	if err != nil {
++		return nil, fmt.Errorf("parsing profile: %v", err)
++	}
++
++	if err := p.CheckValid(); err != nil {
++		return nil, fmt.Errorf("malformed profile: %v", err)
++	}
++	return p, nil
++}
++
++var errUnrecognized = fmt.Errorf("unrecognized profile format")
++var errMalformed = fmt.Errorf("malformed profile format")
++var errNoData = fmt.Errorf("empty input file")
++var errConcatProfile = fmt.Errorf("concatenated profiles detected")
++
++func parseLegacy(data []byte) (*Profile, error) {
++	parsers := []func([]byte) (*Profile, error){
++		parseCPU,
++		parseHeap,
++		parseGoCount, // goroutine, threadcreate
++		parseThread,
++		parseContention,
++		parseJavaProfile,
++	}
++
++	for _, parser := range parsers {
++		p, err := parser(data)
++		if err == nil {
++			p.addLegacyFrameInfo()
++			return p, nil
++		}
++		if err != errUnrecognized {
++			return nil, err
++		}
++	}
++	return nil, errUnrecognized
++}
++
++// ParseUncompressed parses an uncompressed protobuf into a profile.
++func ParseUncompressed(data []byte) (*Profile, error) {
++	if len(data) == 0 {
++		return nil, errNoData
++	}
++	p := &Profile{}
++	if err := unmarshal(data, p); err != nil {
++		return nil, err
++	}
++
++	if err := p.postDecode(); err != nil {
++		return nil, err
++	}
++
++	return p, nil
++}
++
++var libRx = regexp.MustCompile(`([.]so$|[.]so[._][0-9]+)`)
++
++// massageMappings applies heuristic-based changes to the profile
++// mappings to account for quirks of some environments.
++func (p *Profile) massageMappings() {
++	// Merge adjacent regions with matching names, checking that the offsets match
++	if len(p.Mapping) > 1 {
++		mappings := []*Mapping{p.Mapping[0]}
++		for _, m := range p.Mapping[1:] {
++			lm := mappings[len(mappings)-1]
++			if adjacent(lm, m) {
++				lm.Limit = m.Limit
++				if m.File != "" {
++					lm.File = m.File
++				}
++				if m.BuildID != "" {
++					lm.BuildID = m.BuildID
++				}
++				p.updateLocationMapping(m, lm)
++				continue
++			}
++			mappings = append(mappings, m)
++		}
++		p.Mapping = mappings
++	}
++
++	// Use heuristics to identify main binary and move it to the top of the list of mappings
++	for i, m := range p.Mapping {
++		file := strings.TrimSpace(strings.Replace(m.File, "(deleted)", "", -1))
++		if len(file) == 0 {
++			continue
++		}
++		if len(libRx.FindStringSubmatch(file)) > 0 {
++			continue
++		}
++		if file[0] == '[' {
++			continue
++		}
++		// Swap what we guess is main to position 0.
++		p.Mapping[0], p.Mapping[i] = p.Mapping[i], p.Mapping[0]
++		break
++	}
++
++	// Keep the mapping IDs neatly sorted
++	for i, m := range p.Mapping {
++		m.ID = uint64(i + 1)
++	}
++}
++
++// adjacent returns whether two mapping entries represent the same
++// mapping that has been split into two. Check that their addresses are adjacent,
++// and if the offsets match, if they are available.
++func adjacent(m1, m2 *Mapping) bool {
++	if m1.File != "" && m2.File != "" {
++		if m1.File != m2.File {
++			return false
++		}
++	}
++	if m1.BuildID != "" && m2.BuildID != "" {
++		if m1.BuildID != m2.BuildID {
++			return false
++		}
++	}
++	if m1.Limit != m2.Start {
++		return false
++	}
++	if m1.Offset != 0 && m2.Offset != 0 {
++		offset := m1.Offset + (m1.Limit - m1.Start)
++		if offset != m2.Offset {
++			return false
++		}
++	}
++	return true
++}
++
++func (p *Profile) updateLocationMapping(from, to *Mapping) {
++	for _, l := range p.Location {
++		if l.Mapping == from {
++			l.Mapping = to
++		}
++	}
++}
++
++func serialize(p *Profile) []byte {
++	p.encodeMu.Lock()
++	p.preEncode()
++	b := marshal(p)
++	p.encodeMu.Unlock()
++	return b
++}
++
++// Write writes the profile as a gzip-compressed marshaled protobuf.
++func (p *Profile) Write(w io.Writer) error {
++	zw := gzip.NewWriter(w)
++	defer zw.Close()
++	_, err := zw.Write(serialize(p))
++	return err
++}
++
++// WriteUncompressed writes the profile as a marshaled protobuf.
++func (p *Profile) WriteUncompressed(w io.Writer) error {
++	_, err := w.Write(serialize(p))
++	return err
++}
++
++// CheckValid tests whether the profile is valid. Checks include, but are
++// not limited to:
++//   - len(Profile.Sample[n].value) == len(Profile.value_unit)
++//   - Sample.id has a corresponding Profile.Location
++func (p *Profile) CheckValid() error {
++	// Check that sample values are consistent
++	sampleLen := len(p.SampleType)
++	if sampleLen == 0 && len(p.Sample) != 0 {
++		return fmt.Errorf("missing sample type information")
++	}
++	for _, s := range p.Sample {
++		if s == nil {
++			return fmt.Errorf("profile has nil sample")
++		}
++		if len(s.Value) != sampleLen {
++			return fmt.Errorf("mismatch: sample has %d values vs. %d types", len(s.Value), len(p.SampleType))
++		}
++		for _, l := range s.Location {
++			if l == nil {
++				return fmt.Errorf("sample has nil location")
++			}
++		}
++	}
++
++	// Check that all mappings/locations/functions are in the tables
++	// Check that there are no duplicate ids
++	mappings := make(map[uint64]*Mapping, len(p.Mapping))
++	for _, m := range p.Mapping {
++		if m == nil {
++			return fmt.Errorf("profile has nil mapping")
++		}
++		if m.ID == 0 {
++			return fmt.Errorf("found mapping with reserved ID=0")
++		}
++		if mappings[m.ID] != nil {
++			return fmt.Errorf("multiple mappings with same id: %d", m.ID)
++		}
++		mappings[m.ID] = m
++	}
++	functions := make(map[uint64]*Function, len(p.Function))
++	for _, f := range p.Function {
++		if f == nil {
++			return fmt.Errorf("profile has nil function")
++		}
++		if f.ID == 0 {
++			return fmt.Errorf("found function with reserved ID=0")
++		}
++		if functions[f.ID] != nil {
++			return fmt.Errorf("multiple functions with same id: %d", f.ID)
++		}
++		functions[f.ID] = f
++	}
++	locations := make(map[uint64]*Location, len(p.Location))
++	for _, l := range p.Location {
++		if l == nil {
++			return fmt.Errorf("profile has nil location")
++		}
++		if l.ID == 0 {
++			return fmt.Errorf("found location with reserved id=0")
++		}
++		if locations[l.ID] != nil {
++			return fmt.Errorf("multiple locations with same id: %d", l.ID)
++		}
++		locations[l.ID] = l
++		if m := l.Mapping; m != nil {
++			if m.ID == 0 || mappings[m.ID] != m {
++				return fmt.Errorf("inconsistent mapping %p: %d", m, m.ID)
++			}
++		}
++		for _, ln := range l.Line {
++			if f := ln.Function; f != nil {
++				if f.ID == 0 || functions[f.ID] != f {
++					return fmt.Errorf("inconsistent function %p: %d", f, f.ID)
++				}
++			}
++		}
++	}
++	return nil
++}
++
++// Aggregate merges the locations in the profile into equivalence
++// classes preserving the request attributes. It also updates the
++// samples to point to the merged locations.
++func (p *Profile) Aggregate(inlineFrame, function, filename, linenumber, address bool) error {
++	for _, m := range p.Mapping {
++		m.HasInlineFrames = m.HasInlineFrames && inlineFrame
++		m.HasFunctions = m.HasFunctions && function
++		m.HasFilenames = m.HasFilenames && filename
++		m.HasLineNumbers = m.HasLineNumbers && linenumber
++	}
++
++	// Aggregate functions
++	if !function || !filename {
++		for _, f := range p.Function {
++			if !function {
++				f.Name = ""
++				f.SystemName = ""
++			}
++			if !filename {
++				f.Filename = ""
++			}
++		}
++	}
++
++	// Aggregate locations
++	if !inlineFrame || !address || !linenumber {
++		for _, l := range p.Location {
++			if !inlineFrame && len(l.Line) > 1 {
++				l.Line = l.Line[len(l.Line)-1:]
++			}
++			if !linenumber {
++				for i := range l.Line {
++					l.Line[i].Line = 0
++				}
++			}
++			if !address {
++				l.Address = 0
++			}
++		}
++	}
++
++	return p.CheckValid()
++}
++
++// NumLabelUnits returns a map of numeric label keys to the units
++// associated with those keys and a map of those keys to any units
++// that were encountered but not used.
++// Unit for a given key is the first encountered unit for that key. If multiple
++// units are encountered for values paired with a particular key, then the first
++// unit encountered is used and all other units are returned in sorted order
++// in map of ignored units.
++// If no units are encountered for a particular key, the unit is then inferred
++// based on the key.
++func (p *Profile) NumLabelUnits() (map[string]string, map[string][]string) {
++	numLabelUnits := map[string]string{}
++	ignoredUnits := map[string]map[string]bool{}
++	encounteredKeys := map[string]bool{}
++
++	// Determine units based on numeric tags for each sample.
++	for _, s := range p.Sample {
++		for k := range s.NumLabel {
++			encounteredKeys[k] = true
++			for _, unit := range s.NumUnit[k] {
++				if unit == "" {
++					continue
++				}
++				if wantUnit, ok := numLabelUnits[k]; !ok {
++					numLabelUnits[k] = unit
++				} else if wantUnit != unit {
++					if v, ok := ignoredUnits[k]; ok {
++						v[unit] = true
++					} else {
++						ignoredUnits[k] = map[string]bool{unit: true}
++					}
++				}
++			}
++		}
++	}
++	// Infer units for keys without any units associated with
++	// numeric tag values.
++	for key := range encounteredKeys {
++		unit := numLabelUnits[key]
++		if unit == "" {
++			switch key {
++			case "alignment", "request":
++				numLabelUnits[key] = "bytes"
++			default:
++				numLabelUnits[key] = key
++			}
++		}
++	}
++
++	// Copy ignored units into more readable format
++	unitsIgnored := make(map[string][]string, len(ignoredUnits))
++	for key, values := range ignoredUnits {
++		units := make([]string, len(values))
++		i := 0
++		for unit := range values {
++			units[i] = unit
++			i++
++		}
++		sort.Strings(units)
++		unitsIgnored[key] = units
++	}
++
++	return numLabelUnits, unitsIgnored
++}
++
++// String dumps a text representation of a profile. Intended mainly
++// for debugging purposes.
++func (p *Profile) String() string {
++	ss := make([]string, 0, len(p.Comments)+len(p.Sample)+len(p.Mapping)+len(p.Location))
++	for _, c := range p.Comments {
++		ss = append(ss, "Comment: "+c)
++	}
++	if pt := p.PeriodType; pt != nil {
++		ss = append(ss, fmt.Sprintf("PeriodType: %s %s", pt.Type, pt.Unit))
++	}
++	ss = append(ss, fmt.Sprintf("Period: %d", p.Period))
++	if p.TimeNanos != 0 {
++		ss = append(ss, fmt.Sprintf("Time: %v", time.Unix(0, p.TimeNanos)))
++	}
++	if p.DurationNanos != 0 {
++		ss = append(ss, fmt.Sprintf("Duration: %.4v", time.Duration(p.DurationNanos)))
++	}
++
++	ss = append(ss, "Samples:")
++	var sh1 string
++	for _, s := range p.SampleType {
++		dflt := ""
++		if s.Type == p.DefaultSampleType {
++			dflt = "[dflt]"
++		}
++		sh1 = sh1 + fmt.Sprintf("%s/%s%s ", s.Type, s.Unit, dflt)
++	}
++	ss = append(ss, strings.TrimSpace(sh1))
++	for _, s := range p.Sample {
++		ss = append(ss, s.string())
++	}
++
++	ss = append(ss, "Locations")
++	for _, l := range p.Location {
++		ss = append(ss, l.string())
++	}
++
++	ss = append(ss, "Mappings")
++	for _, m := range p.Mapping {
++		ss = append(ss, m.string())
++	}
++
++	return strings.Join(ss, "\n") + "\n"
++}
++
++// string dumps a text representation of a mapping. Intended mainly
++// for debugging purposes.
++func (m *Mapping) string() string {
++	bits := ""
++	if m.HasFunctions {
++		bits = bits + "[FN]"
++	}
++	if m.HasFilenames {
++		bits = bits + "[FL]"
++	}
++	if m.HasLineNumbers {
++		bits = bits + "[LN]"
++	}
++	if m.HasInlineFrames {
++		bits = bits + "[IN]"
++	}
++	return fmt.Sprintf("%d: %#x/%#x/%#x %s %s %s",
++		m.ID,
++		m.Start, m.Limit, m.Offset,
++		m.File,
++		m.BuildID,
++		bits)
++}
++
++// string dumps a text representation of a location. Intended mainly
++// for debugging purposes.
++func (l *Location) string() string {
++	ss := []string{}
++	locStr := fmt.Sprintf("%6d: %#x ", l.ID, l.Address)
++	if m := l.Mapping; m != nil {
++		locStr = locStr + fmt.Sprintf("M=%d ", m.ID)
++	}
++	if l.IsFolded {
++		locStr = locStr + "[F] "
++	}
++	if len(l.Line) == 0 {
++		ss = append(ss, locStr)
++	}
++	for li := range l.Line {
++		lnStr := "??"
++		if fn := l.Line[li].Function; fn != nil {
++			lnStr = fmt.Sprintf("%s %s:%d s=%d",
++				fn.Name,
++				fn.Filename,
++				l.Line[li].Line,
++				fn.StartLine)
++			if fn.Name != fn.SystemName {
++				lnStr = lnStr + "(" + fn.SystemName + ")"
++			}
++		}
++		ss = append(ss, locStr+lnStr)
++		// Do not print location details past the first line
++		locStr = "             "
++	}
++	return strings.Join(ss, "\n")
++}
++
++// string dumps a text representation of a sample. Intended mainly
++// for debugging purposes.
++func (s *Sample) string() string {
++	ss := []string{}
++	var sv string
++	for _, v := range s.Value {
++		sv = fmt.Sprintf("%s %10d", sv, v)
++	}
++	sv = sv + ": "
++	for _, l := range s.Location {
++		sv = sv + fmt.Sprintf("%d ", l.ID)
++	}
++	ss = append(ss, sv)
++	const labelHeader = "                "
++	if len(s.Label) > 0 {
++		ss = append(ss, labelHeader+labelsToString(s.Label))
++	}
++	if len(s.NumLabel) > 0 {
++		ss = append(ss, labelHeader+numLabelsToString(s.NumLabel, s.NumUnit))
++	}
++	return strings.Join(ss, "\n")
++}
++
++// labelsToString returns a string representation of a
++// map representing labels.
++func labelsToString(labels map[string][]string) string {
++	ls := []string{}
++	for k, v := range labels {
++		ls = append(ls, fmt.Sprintf("%s:%v", k, v))
++	}
++	sort.Strings(ls)
++	return strings.Join(ls, " ")
++}
++
++// numLablesToString returns a string representation of a map
++// representing numeric labels.
++func numLabelsToString(numLabels map[string][]int64, numUnits map[string][]string) string {
++	ls := []string{}
++	for k, v := range numLabels {
++		units := numUnits[k]
++		var labelString string
++		if len(units) == len(v) {
++			values := make([]string, len(v))
++			for i, vv := range v {
++				values[i] = fmt.Sprintf("%d %s", vv, units[i])
++			}
++			labelString = fmt.Sprintf("%s:%v", k, values)
++		} else {
++			labelString = fmt.Sprintf("%s:%v", k, v)
++		}
++		ls = append(ls, labelString)
++	}
++	sort.Strings(ls)
++	return strings.Join(ls, " ")
++}
++
++// SetLabel sets the specified key to the specified value for all samples in the
++// profile.
++func (p *Profile) SetLabel(key string, value []string) {
++	for _, sample := range p.Sample {
++		if sample.Label == nil {
++			sample.Label = map[string][]string{key: value}
++		} else {
++			sample.Label[key] = value
++		}
++	}
++}
++
++// RemoveLabel removes all labels associated with the specified key for all
++// samples in the profile.
++func (p *Profile) RemoveLabel(key string) {
++	for _, sample := range p.Sample {
++		delete(sample.Label, key)
++	}
++}
++
++// HasLabel returns true if a sample has a label with indicated key and value.
++func (s *Sample) HasLabel(key, value string) bool {
++	for _, v := range s.Label[key] {
++		if v == value {
++			return true
++		}
++	}
++	return false
++}
++
++// DiffBaseSample returns true if a sample belongs to the diff base and false
++// otherwise.
++func (s *Sample) DiffBaseSample() bool {
++	return s.HasLabel("pprof::base", "true")
++}
++
++// Scale multiplies all sample values in a profile by a constant.
++func (p *Profile) Scale(ratio float64) {
++	if ratio == 1 {
++		return
++	}
++	ratios := make([]float64, len(p.SampleType))
++	for i := range p.SampleType {
++		ratios[i] = ratio
++	}
++	p.ScaleN(ratios)
++}
++
++// ScaleN multiplies each sample values in a sample by a different amount.
++func (p *Profile) ScaleN(ratios []float64) error {
++	if len(p.SampleType) != len(ratios) {
++		return fmt.Errorf("mismatched scale ratios, got %d, want %d", len(ratios), len(p.SampleType))
++	}
++	allOnes := true
++	for _, r := range ratios {
++		if r != 1 {
++			allOnes = false
++			break
++		}
++	}
++	if allOnes {
++		return nil
++	}
++	for _, s := range p.Sample {
++		for i, v := range s.Value {
++			if ratios[i] != 1 {
++				s.Value[i] = int64(float64(v) * ratios[i])
++			}
++		}
++	}
++	return nil
++}
++
++// HasFunctions determines if all locations in this profile have
++// symbolized function information.
++func (p *Profile) HasFunctions() bool {
++	for _, l := range p.Location {
++		if l.Mapping != nil && !l.Mapping.HasFunctions {
++			return false
++		}
++	}
++	return true
++}
++
++// HasFileLines determines if all locations in this profile have
++// symbolized file and line number information.
++func (p *Profile) HasFileLines() bool {
++	for _, l := range p.Location {
++		if l.Mapping != nil && (!l.Mapping.HasFilenames || !l.Mapping.HasLineNumbers) {
++			return false
++		}
++	}
++	return true
++}
++
++// Unsymbolizable returns true if a mapping points to a binary for which
++// locations can't be symbolized in principle, at least now. Examples are
++// "[vdso]", [vsyscall]" and some others, see the code.
++func (m *Mapping) Unsymbolizable() bool {
++	name := filepath.Base(m.File)
++	return strings.HasPrefix(name, "[") || strings.HasPrefix(name, "linux-vdso") || strings.HasPrefix(m.File, "/dev/dri/")
++}
++
++// Copy makes a fully independent copy of a profile.
++func (p *Profile) Copy() *Profile {
++	pp := &Profile{}
++	if err := unmarshal(serialize(p), pp); err != nil {
++		panic(err)
++	}
++	if err := pp.postDecode(); err != nil {
++		panic(err)
++	}
++
++	return pp
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/proto.go b/src/vendor/github_com/google/pprof/profile/proto.go
+new file mode 100644
+index 0000000000..e7df33ac2b
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/proto.go
+@@ -0,0 +1,367 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// This file is a simple protocol buffer encoder and decoder.
++// The format is described at
++// https://developers.google.com/protocol-buffers/docs/encoding
++//
++// A protocol message must implement the message interface:
++//   decoder() []decoder
++//   encode(*buffer)
++//
++// The decode method returns a slice indexed by field number that gives the
++// function to decode that field.
++// The encode method encodes its receiver into the given buffer.
++//
++// The two methods are simple enough to be implemented by hand rather than
++// by using a protocol compiler.
++//
++// See profile.go for examples of messages implementing this interface.
++//
++// There is no support for groups, message sets, or "has" bits.
++
++package profile
++
++import "errors"
++
++type buffer struct {
++	field int // field tag
++	typ   int // proto wire type code for field
++	u64   uint64
++	data  []byte
++	tmp   [16]byte
++}
++
++type decoder func(*buffer, message) error
++
++type message interface {
++	decoder() []decoder
++	encode(*buffer)
++}
++
++func marshal(m message) []byte {
++	var b buffer
++	m.encode(&b)
++	return b.data
++}
++
++func encodeVarint(b *buffer, x uint64) {
++	for x >= 128 {
++		b.data = append(b.data, byte(x)|0x80)
++		x >>= 7
++	}
++	b.data = append(b.data, byte(x))
++}
++
++func encodeLength(b *buffer, tag int, len int) {
++	encodeVarint(b, uint64(tag)<<3|2)
++	encodeVarint(b, uint64(len))
++}
++
++func encodeUint64(b *buffer, tag int, x uint64) {
++	// append varint to b.data
++	encodeVarint(b, uint64(tag)<<3)
++	encodeVarint(b, x)
++}
++
++func encodeUint64s(b *buffer, tag int, x []uint64) {
++	if len(x) > 2 {
++		// Use packed encoding
++		n1 := len(b.data)
++		for _, u := range x {
++			encodeVarint(b, u)
++		}
++		n2 := len(b.data)
++		encodeLength(b, tag, n2-n1)
++		n3 := len(b.data)
++		copy(b.tmp[:], b.data[n2:n3])
++		copy(b.data[n1+(n3-n2):], b.data[n1:n2])
++		copy(b.data[n1:], b.tmp[:n3-n2])
++		return
++	}
++	for _, u := range x {
++		encodeUint64(b, tag, u)
++	}
++}
++
++func encodeUint64Opt(b *buffer, tag int, x uint64) {
++	if x == 0 {
++		return
++	}
++	encodeUint64(b, tag, x)
++}
++
++func encodeInt64(b *buffer, tag int, x int64) {
++	u := uint64(x)
++	encodeUint64(b, tag, u)
++}
++
++func encodeInt64s(b *buffer, tag int, x []int64) {
++	if len(x) > 2 {
++		// Use packed encoding
++		n1 := len(b.data)
++		for _, u := range x {
++			encodeVarint(b, uint64(u))
++		}
++		n2 := len(b.data)
++		encodeLength(b, tag, n2-n1)
++		n3 := len(b.data)
++		copy(b.tmp[:], b.data[n2:n3])
++		copy(b.data[n1+(n3-n2):], b.data[n1:n2])
++		copy(b.data[n1:], b.tmp[:n3-n2])
++		return
++	}
++	for _, u := range x {
++		encodeInt64(b, tag, u)
++	}
++}
++
++func encodeInt64Opt(b *buffer, tag int, x int64) {
++	if x == 0 {
++		return
++	}
++	encodeInt64(b, tag, x)
++}
++
++func encodeString(b *buffer, tag int, x string) {
++	encodeLength(b, tag, len(x))
++	b.data = append(b.data, x...)
++}
++
++func encodeStrings(b *buffer, tag int, x []string) {
++	for _, s := range x {
++		encodeString(b, tag, s)
++	}
++}
++
++func encodeBool(b *buffer, tag int, x bool) {
++	if x {
++		encodeUint64(b, tag, 1)
++	} else {
++		encodeUint64(b, tag, 0)
++	}
++}
++
++func encodeBoolOpt(b *buffer, tag int, x bool) {
++	if x {
++		encodeBool(b, tag, x)
++	}
++}
++
++func encodeMessage(b *buffer, tag int, m message) {
++	n1 := len(b.data)
++	m.encode(b)
++	n2 := len(b.data)
++	encodeLength(b, tag, n2-n1)
++	n3 := len(b.data)
++	copy(b.tmp[:], b.data[n2:n3])
++	copy(b.data[n1+(n3-n2):], b.data[n1:n2])
++	copy(b.data[n1:], b.tmp[:n3-n2])
++}
++
++func unmarshal(data []byte, m message) (err error) {
++	b := buffer{data: data, typ: 2}
++	return decodeMessage(&b, m)
++}
++
++func le64(p []byte) uint64 {
++	return uint64(p[0]) | uint64(p[1])<<8 | uint64(p[2])<<16 | uint64(p[3])<<24 | uint64(p[4])<<32 | uint64(p[5])<<40 | uint64(p[6])<<48 | uint64(p[7])<<56
++}
++
++func le32(p []byte) uint32 {
++	return uint32(p[0]) | uint32(p[1])<<8 | uint32(p[2])<<16 | uint32(p[3])<<24
++}
++
++func decodeVarint(data []byte) (uint64, []byte, error) {
++	var u uint64
++	for i := 0; ; i++ {
++		if i >= 10 || i >= len(data) {
++			return 0, nil, errors.New("bad varint")
++		}
++		u |= uint64(data[i]&0x7F) << uint(7*i)
++		if data[i]&0x80 == 0 {
++			return u, data[i+1:], nil
++		}
++	}
++}
++
++func decodeField(b *buffer, data []byte) ([]byte, error) {
++	x, data, err := decodeVarint(data)
++	if err != nil {
++		return nil, err
++	}
++	b.field = int(x >> 3)
++	b.typ = int(x & 7)
++	b.data = nil
++	b.u64 = 0
++	switch b.typ {
++	case 0:
++		b.u64, data, err = decodeVarint(data)
++		if err != nil {
++			return nil, err
++		}
++	case 1:
++		if len(data) < 8 {
++			return nil, errors.New("not enough data")
++		}
++		b.u64 = le64(data[:8])
++		data = data[8:]
++	case 2:
++		var n uint64
++		n, data, err = decodeVarint(data)
++		if err != nil {
++			return nil, err
++		}
++		if n > uint64(len(data)) {
++			return nil, errors.New("too much data")
++		}
++		b.data = data[:n]
++		data = data[n:]
++	case 5:
++		if len(data) < 4 {
++			return nil, errors.New("not enough data")
++		}
++		b.u64 = uint64(le32(data[:4]))
++		data = data[4:]
++	default:
++		return nil, errors.New("unknown wire type: " + string(b.typ))
++	}
++
++	return data, nil
++}
++
++func checkType(b *buffer, typ int) error {
++	if b.typ != typ {
++		return errors.New("type mismatch")
++	}
++	return nil
++}
++
++func decodeMessage(b *buffer, m message) error {
++	if err := checkType(b, 2); err != nil {
++		return err
++	}
++	dec := m.decoder()
++	data := b.data
++	for len(data) > 0 {
++		// pull varint field# + type
++		var err error
++		data, err = decodeField(b, data)
++		if err != nil {
++			return err
++		}
++		if b.field >= len(dec) || dec[b.field] == nil {
++			continue
++		}
++		if err := dec[b.field](b, m); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func decodeInt64(b *buffer, x *int64) error {
++	if err := checkType(b, 0); err != nil {
++		return err
++	}
++	*x = int64(b.u64)
++	return nil
++}
++
++func decodeInt64s(b *buffer, x *[]int64) error {
++	if b.typ == 2 {
++		// Packed encoding
++		data := b.data
++		tmp := make([]int64, 0, len(data)) // Maximally sized
++		for len(data) > 0 {
++			var u uint64
++			var err error
++
++			if u, data, err = decodeVarint(data); err != nil {
++				return err
++			}
++			tmp = append(tmp, int64(u))
++		}
++		*x = append(*x, tmp...)
++		return nil
++	}
++	var i int64
++	if err := decodeInt64(b, &i); err != nil {
++		return err
++	}
++	*x = append(*x, i)
++	return nil
++}
++
++func decodeUint64(b *buffer, x *uint64) error {
++	if err := checkType(b, 0); err != nil {
++		return err
++	}
++	*x = b.u64
++	return nil
++}
++
++func decodeUint64s(b *buffer, x *[]uint64) error {
++	if b.typ == 2 {
++		data := b.data
++		// Packed encoding
++		tmp := make([]uint64, 0, len(data)) // Maximally sized
++		for len(data) > 0 {
++			var u uint64
++			var err error
++
++			if u, data, err = decodeVarint(data); err != nil {
++				return err
++			}
++			tmp = append(tmp, u)
++		}
++		*x = append(*x, tmp...)
++		return nil
++	}
++	var u uint64
++	if err := decodeUint64(b, &u); err != nil {
++		return err
++	}
++	*x = append(*x, u)
++	return nil
++}
++
++func decodeString(b *buffer, x *string) error {
++	if err := checkType(b, 2); err != nil {
++		return err
++	}
++	*x = string(b.data)
++	return nil
++}
++
++func decodeStrings(b *buffer, x *[]string) error {
++	var s string
++	if err := decodeString(b, &s); err != nil {
++		return err
++	}
++	*x = append(*x, s)
++	return nil
++}
++
++func decodeBool(b *buffer, x *bool) error {
++	if err := checkType(b, 0); err != nil {
++		return err
++	}
++	if int64(b.u64) == 0 {
++		*x = false
++	} else {
++		*x = true
++	}
++	return nil
++}
+diff --git a/src/vendor/github_com/google/pprof/profile/prune.go b/src/vendor/github_com/google/pprof/profile/prune.go
+new file mode 100644
+index 0000000000..02d21a8184
+--- /dev/null
++++ b/src/vendor/github_com/google/pprof/profile/prune.go
+@@ -0,0 +1,178 @@
++// Copyright 2014 Google Inc. All Rights Reserved.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// Implements methods to remove frames from profiles.
++
++package profile
++
++import (
++	"fmt"
++	"regexp"
++	"strings"
++)
++
++var (
++	reservedNames = []string{"(anonymous namespace)", "operator()"}
++	bracketRx     = func() *regexp.Regexp {
++		var quotedNames []string
++		for _, name := range append(reservedNames, "(") {
++			quotedNames = append(quotedNames, regexp.QuoteMeta(name))
++		}
++		return regexp.MustCompile(strings.Join(quotedNames, "|"))
++	}()
++)
++
++// simplifyFunc does some primitive simplification of function names.
++func simplifyFunc(f string) string {
++	// Account for leading '.' on the PPC ELF v1 ABI.
++	funcName := strings.TrimPrefix(f, ".")
++	// Account for unsimplified names -- try  to remove the argument list by trimming
++	// starting from the first '(', but skipping reserved names that have '('.
++	for _, ind := range bracketRx.FindAllStringSubmatchIndex(funcName, -1) {
++		foundReserved := false
++		for _, res := range reservedNames {
++			if funcName[ind[0]:ind[1]] == res {
++				foundReserved = true
++				break
++			}
++		}
++		if !foundReserved {
++			funcName = funcName[:ind[0]]
++			break
++		}
++	}
++	return funcName
++}
++
++// Prune removes all nodes beneath a node matching dropRx, and not
++// matching keepRx. If the root node of a Sample matches, the sample
++// will have an empty stack.
++func (p *Profile) Prune(dropRx, keepRx *regexp.Regexp) {
++	prune := make(map[uint64]bool)
++	pruneBeneath := make(map[uint64]bool)
++
++	for _, loc := range p.Location {
++		var i int
++		for i = len(loc.Line) - 1; i >= 0; i-- {
++			if fn := loc.Line[i].Function; fn != nil && fn.Name != "" {
++				funcName := simplifyFunc(fn.Name)
++				if dropRx.MatchString(funcName) {
++					if keepRx == nil || !keepRx.MatchString(funcName) {
++						break
++					}
++				}
++			}
++		}
++
++		if i >= 0 {
++			// Found matching entry to prune.
++			pruneBeneath[loc.ID] = true
++
++			// Remove the matching location.
++			if i == len(loc.Line)-1 {
++				// Matched the top entry: prune the whole location.
++				prune[loc.ID] = true
++			} else {
++				loc.Line = loc.Line[i+1:]
++			}
++		}
++	}
++
++	// Prune locs from each Sample
++	for _, sample := range p.Sample {
++		// Scan from the root to the leaves to find the prune location.
++		// Do not prune frames before the first user frame, to avoid
++		// pruning everything.
++		foundUser := false
++		for i := len(sample.Location) - 1; i >= 0; i-- {
++			id := sample.Location[i].ID
++			if !prune[id] && !pruneBeneath[id] {
++				foundUser = true
++				continue
++			}
++			if !foundUser {
++				continue
++			}
++			if prune[id] {
++				sample.Location = sample.Location[i+1:]
++				break
++			}
++			if pruneBeneath[id] {
++				sample.Location = sample.Location[i:]
++				break
++			}
++		}
++	}
++}
++
++// RemoveUninteresting prunes and elides profiles using built-in
++// tables of uninteresting function names.
++func (p *Profile) RemoveUninteresting() error {
++	var keep, drop *regexp.Regexp
++	var err error
++
++	if p.DropFrames != "" {
++		if drop, err = regexp.Compile("^(" + p.DropFrames + ")$"); err != nil {
++			return fmt.Errorf("failed to compile regexp %s: %v", p.DropFrames, err)
++		}
++		if p.KeepFrames != "" {
++			if keep, err = regexp.Compile("^(" + p.KeepFrames + ")$"); err != nil {
++				return fmt.Errorf("failed to compile regexp %s: %v", p.KeepFrames, err)
++			}
++		}
++		p.Prune(drop, keep)
++	}
++	return nil
++}
++
++// PruneFrom removes all nodes beneath the lowest node matching dropRx, not including itself.
++//
++// Please see the example below to understand this method as well as
++// the difference from Prune method.
++//
++// A sample contains Location of [A,B,C,B,D] where D is the top frame and there's no inline.
++//
++// PruneFrom(A) returns [A,B,C,B,D] because there's no node beneath A.
++// Prune(A, nil) returns [B,C,B,D] by removing A itself.
++//
++// PruneFrom(B) returns [B,C,B,D] by removing all nodes beneath the first B when scanning from the bottom.
++// Prune(B, nil) returns [D] because a matching node is found by scanning from the root.
++func (p *Profile) PruneFrom(dropRx *regexp.Regexp) {
++	pruneBeneath := make(map[uint64]bool)
++
++	for _, loc := range p.Location {
++		for i := 0; i < len(loc.Line); i++ {
++			if fn := loc.Line[i].Function; fn != nil && fn.Name != "" {
++				funcName := simplifyFunc(fn.Name)
++				if dropRx.MatchString(funcName) {
++					// Found matching entry to prune.
++					pruneBeneath[loc.ID] = true
++					loc.Line = loc.Line[i:]
++					break
++				}
++			}
++		}
++	}
++
++	// Prune locs from each Sample
++	for _, sample := range p.Sample {
++		// Scan from the bottom leaf to the root to find the prune location.
++		for i, loc := range sample.Location {
++			if pruneBeneath[loc.ID] {
++				sample.Location = sample.Location[i:]
++				break
++			}
++		}
++	}
++}
