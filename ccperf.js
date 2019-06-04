@@ -779,6 +779,7 @@ class DefaultChaincodeTxPlugin {
         this._genArgsTable = {
             'putstate': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
             'getstate': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
+            'rangequery': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
             'mix': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
             'json': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
         }
@@ -793,6 +794,16 @@ class DefaultChaincodeTxPlugin {
     }
 
     getTxHandler(txType) {
+        if (txType == 'rangequery') {
+            return {
+                chaincodeId: this.getChaincodeId(),
+                isQuery: true,
+                fcn: txType,
+                genArgs: this._genArgsTable[txType],
+                genTransientMap: undefined,
+                genUserName: undefined,
+            };
+        }
         return {
             chaincodeId: this.getChaincodeId(),
             isQuery: false,
@@ -824,6 +835,7 @@ class Worker {
         this.genArgs = handler.genArgs;
         this.genTransientMap = handler.genTransientMap;
         this.genUserName = handler.genUserName;
+        this.isQuery = handler.isQuery
 
         if (config.logdir) {
             const requestsLogPath = config.logdir + '/requests-' + cluster.worker.id + '.json';
@@ -935,9 +947,9 @@ class Worker {
         let client = this.client;
         let channel = this.channel;
 
-	let username;
+        let username;
         if (this.config.clientKeystore !== undefined) {
-	    //client = sdk.loadFromConfig(this.config.profile);
+            //client = sdk.loadFromConfig(this.config.profile);
             client = new sdk();
             client._network_config = this.client._network_config; //FIXME
             client.setCryptoSuite(this.cryptoSuite);
@@ -976,36 +988,41 @@ class Worker {
 
         this.histgramEndorsement.observe({ "ccperf": "test" }, (t2 - t1) / 1000);
 
-        const proposalResponses = results[0];
+        let t3;
 
-        if (proposalResponses.length == 0) {
-            console.error('Endorsement failure: Proposal response is empty');
-            return;
+        if (!this.isQuery) {
+
+
+            const proposalResponses = results[0];
+
+            if (proposalResponses.length == 0) {
+                console.error('Endorsement failure: Proposal response is empty');
+                return;
+            }
+            if (!proposalResponses.reduce((ok, res) => ok && res.response && res.response.status == 200, true)) {
+                const res = proposalResponses.filter(res => !res.response || res.response.status != 200)[0];
+                console.error('Endorsement failure: ' + res.message);
+                return;
+            }
+
+            const proposal = results[1];
+
+            const orderer_request = {
+                txId: tx_id,
+                proposalResponses: proposalResponses,
+                proposal: proposal,
+            };
+
+            if (this.orderer) {
+                orderer_request.orderer = this.orderer;
+            }
+
+            const orderer_results = await channel.sendTransaction(orderer_request);
+
+            t3 = Date.now();
+
+            this.histgramSendTransaction.observe({ "ccperf": "test" }, (t3 - t2) / 1000);
         }
-        if (!proposalResponses.reduce((ok, res) => ok && res.response && res.response.status == 200, true)) {
-            const res = proposalResponses.filter(res => !res.response || res.response.status != 200)[0];
-            console.error('Endorsement failure: ' + res.message);
-            return;
-        }
-
-        const proposal = results[1];
-
-        const orderer_request = {
-            txId: tx_id,
-            proposalResponses: proposalResponses,
-            proposal: proposal,
-        };
-
-        if (this.orderer) {
-            orderer_request.orderer = this.orderer;
-        }
-
-        const orderer_results = await channel.sendTransaction(orderer_request);
-
-        const t3 = Date.now();
-
-        this.histgramSendTransaction.observe({ "ccperf": "test" }, (t3 - t2) / 1000);
-
         process.send({
             type: 'tx',
             tx: {
