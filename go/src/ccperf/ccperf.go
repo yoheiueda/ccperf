@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
 	"strconv"
 	"strings"
 
@@ -13,7 +14,14 @@ import (
 	pb "github.com/hyperledger/fabric/protos/peer"
 )
 
-var logger = shim.NewLogger("ccperf")
+type log struct {}
+func (l log) Debug(v ...interface{}) {}
+func (l log) Debugf(format string, v ...interface{}) {}
+func (l log) Info(v ...interface{}) { fmt.Println(v...) }
+func (l log) Infof(format string, v ...interface{}) { fmt.Printf(format, v...) }
+func (l log) Error(v ...interface{}) { fmt.Fprint(os.Stderr, v...) }
+func (l log) Errorf(format string, v ...interface{}) { fmt.Fprintf(os.Stderr, format, v...)  }
+var logger log
 
 // CCPerf
 type CCPerf struct {
@@ -435,7 +443,7 @@ func (ccperf *CCPerf) runAllocation(stub shim.ChaincodeStubInterface, args []str
 func main() {
 	go http.ListenAndServe("0.0.0.0:6060", nil)
 
-	logger.SetLevel(shim.LogInfo)
+	//logger.SetLevel(shim.LogInfo)
 	logger.Info("CCPerf chaincode started")
 	defer logger.Info("CCPerf chaincode finished")
 
