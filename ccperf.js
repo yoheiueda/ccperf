@@ -161,6 +161,7 @@ async function populate(config, channel) {
 class LocalDriver {
     constructor() {
         this.txTable = new Map();
+        this.eventTable = new Map();
         this.registry = new prom.Registry()
         this.histgramCommit = new prom.Histogram({
             name: 'ccperf_commit',
@@ -251,6 +252,19 @@ class LocalDriver {
                 if (msg.type === 'tx') {
                     const tx = msg.tx;
                     driver.txTable.set(tx.id, tx);
+                }
+            });
+
+            w.on('message', msg => {
+                if (msg.type === 'eventRegister') {
+                    const txid = msg.txid;
+                    driver.eventTable.set(txid, {
+                        worker: w
+                    });
+                    w.send({
+                        type: 'eventRegistered',
+                        txid: txid
+                    });
                 }
             });
 
@@ -369,6 +383,14 @@ class LocalDriver {
                 this.quantileSendTransaction.push((tx.t3 - tx.t2) / 1000);
                 this.quantileCommit.push(commitLatency);
                 this.quantileE2E.push(e2eLatency);
+            }
+            const event = this.eventTable.get(txid);
+            if (event !== undefined) {
+                this.eventTable.delete(txid);
+                event.worker.send({
+                    type: 'eventOccurred',
+                    tx: commit
+                });
             }
         }
     }
@@ -720,7 +742,7 @@ class Master {
                 driver = new RemoteDriver(hostport);
             }
             if (processes === undefined) {
-                 processes = config.processes / config.remotes.length;
+                processes = config.processes / config.remotes.length;
             }
             const driverConfig = Object.assign({}, config);
             driverConfig.asignedProcesses = processes;
@@ -786,6 +808,7 @@ class DefaultChaincodeTxPlugin {
             'rangequery': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
             'mix': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
             'json': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
+            'contended': context => [String(context.config.num), String(context.config.size), util.format('%d_%d', context.workerID, context.index), String(context.config.population)],
         }
     }
 
@@ -798,24 +821,22 @@ class DefaultChaincodeTxPlugin {
     }
 
     getTxHandler(txType) {
-        if (txType == 'rangequery') {
-            return {
-                chaincodeId: this.getChaincodeId(),
-                isQuery: true,
-                fcn: txType,
-                genArgs: this._genArgsTable[txType],
-                genTransientMap: undefined,
-                genUserName: undefined,
-            };
-        }
-        return {
+        const handler = {
             chaincodeId: this.getChaincodeId(),
             isQuery: false,
+            retry: false,
             fcn: txType,
             genArgs: this._genArgsTable[txType],
             genTransientMap: undefined,
             genUserName: undefined,
         };
+        if (txType == 'rangequery') {
+            handler.isQuery = true;
+        }
+        if (txType == 'contended') {
+            handler.retry = true;
+        }
+        return handler;
     }
 }
 
@@ -840,6 +861,11 @@ class Worker {
         this.genTransientMap = handler.genTransientMap;
         this.genUserName = handler.genUserName;
         this.isQuery = handler.isQuery
+        this.retry = handler.retry
+
+        if (this.retry) {
+            this.eventTable = new Map();
+        }
 
         if (config.logdir) {
             const requestsLogPath = config.logdir + '/requests-' + cluster.worker.id + '.json';
@@ -888,6 +914,23 @@ class Worker {
             const orderers = this.channel.getOrderers();
             const orderer = orderers[cluster.worker.id % orderers.length];
             this.orderer = orderer.getName();
+        }
+
+        if (this.retry) {
+            process.on('message', msg => {
+                if (msg.type === 'eventRegistered') {
+                    const event = this.eventTable.get(msg.txid);
+                    event.registeredResolve(msg);
+                }
+            });
+            process.on('message', msg => {
+                if (msg.type === 'eventOccurred') {
+                    const txid = msg.tx.txid;
+                    const event = this.eventTable.get(txid);
+                    this.eventTable.delete(txid);
+                    event.occurredResolve(msg);
+                }
+            });
         }
 
         const promise = new Promise(resolve => {
@@ -970,78 +1013,115 @@ class Worker {
             client._network_config._client_context = oldClientContext;
         }
 
-        const tx_id = client.newTransactionID();
-
-        const request = {
-            targets: this.peers,
-            chaincodeId: this.chaincodeId,
-            fcn: this.fcn,
-            args: this.genArgs(this, username),
-            txId: tx_id
-        };
-
-        if (this.genTransientMap) {
-            request.transientMap = this.genTransientMap(this);
-        }
-
-        const t1 = Date.now();
-
-        const results = await channel.sendTransactionProposal(request);
-
-        const t2 = Date.now();
-
-        this.histgramEndorsement.observe({ "ccperf": "test" }, (t2 - t1) / 1000);
-
-        let t3;
-
-        if (!this.isQuery) {
+        while (true) {
 
 
-            const proposalResponses = results[0];
+            const tx_id = client.newTransactionID();
 
-            if (proposalResponses.length == 0) {
-                console.error('Endorsement failure: Proposal response is empty');
-                return;
-            }
-            if (!proposalResponses.reduce((ok, res) => ok && res.response && res.response.status == 200, true)) {
-                const res = proposalResponses.filter(res => !res.response || res.response.status != 200)[0];
-                console.error('Endorsement failure: ' + res.message);
-                return;
-            }
-
-            const proposal = results[1];
-
-            const orderer_request = {
-                txId: tx_id,
-                proposalResponses: proposalResponses,
-                proposal: proposal,
+            const request = {
+                targets: this.peers,
+                chaincodeId: this.chaincodeId,
+                fcn: this.fcn,
+                args: this.genArgs(this, username),
+                txId: tx_id
             };
 
-            if (this.orderer) {
-                orderer_request.orderer = this.orderer;
+            if (this.genTransientMap) {
+                request.transientMap = this.genTransientMap(this);
             }
 
-            const orderer_results = await channel.sendTransaction(orderer_request);
 
-            t3 = Date.now();
+            const t1 = Date.now();
 
-            this.histgramSendTransaction.observe({ "ccperf": "test" }, (t3 - t2) / 1000);
-        }
-        process.send({
-            type: 'tx',
-            tx: {
-                id: tx_id.getTransactionID(),
-                t1: t1,
-                t2: t2,
-                t3: t3
+            const results = await channel.sendTransactionProposal(request);
+
+            const t2 = Date.now();
+
+            this.histgramEndorsement.observe({ "ccperf": "test" }, (t2 - t1) / 1000);
+
+            let t3;
+            let eventPromise;
+
+            if (!this.isQuery) {
+
+
+                const proposalResponses = results[0];
+
+                if (proposalResponses.length == 0) {
+                    console.error('Endorsement failure: Proposal response is empty');
+                    return;
+                }
+                if (!proposalResponses.reduce((ok, res) => ok && res.response && res.response.status == 200, true)) {
+                    const res = proposalResponses.filter(res => !res.response || res.response.status != 200)[0];
+                    console.error('Endorsement failure: ' + res.message);
+                    return;
+                }
+
+                const proposal = results[1];
+
+                const orderer_request = {
+                    txId: tx_id,
+                    proposalResponses: proposalResponses,
+                    proposal: proposal,
+                };
+
+                if (this.orderer) {
+                    orderer_request.orderer = this.orderer;
+                }
+
+                if (this.retry) {
+                    const worker = this;
+                    const p = new Promise(resolve => {
+                        worker.eventTable.set(tx_id.getTransactionID(), {
+                            registeredResolve: resolve
+                        });
+                    });
+
+                    process.send({
+                        type: 'eventRegister',
+                        txid: tx_id.getTransactionID()
+                    });
+
+                    await p;
+
+                    eventPromise = new Promise(resolve => {
+                        worker.eventTable.set(tx_id.getTransactionID(), {
+                            occurredResolve: resolve
+                        });
+                    });
+                }
+
+                const orderer_results = await channel.sendTransaction(orderer_request);
+
+                t3 = Date.now();
+
+                this.histgramSendTransaction.observe({ "ccperf": "test" }, (t3 - t2) / 1000);
             }
-        });
+            process.send({
+                type: 'tx',
+                tx: {
+                    id: tx_id.getTransactionID(),
+                    t1: t1,
+                    t2: t2,
+                    t3: t3
+                }
+            });
 
-        if (this.requestsLog) {
-            if (this.index > 0) {
-                this.requestsLog.write(',\n');
+            if (this.requestsLog) {
+                if (this.index > 0) {
+                    this.requestsLog.write(',\n');
+                }
+                this.requestsLog.write(JSON.stringify({ txid: tx_id.getTransactionID(), peer: [{ submission: t1, response: t2 }], orderer: { submission: t2, response: t3 } }, undefined, 4));
             }
-            this.requestsLog.write(JSON.stringify({ txid: tx_id.getTransactionID(), peer: [{ submission: t1, response: t2 }], orderer: { submission: t2, response: t3 } }, undefined, 4));
+
+            if (this.retry) {
+                const msg = await eventPromise;
+                if (msg.tx.tx_validation_code != 'VALID') {
+                    //console.log('msg.tx_validation_code=', msg.tx.tx_validation_code);
+                    continue;
+                }
+            }
+            break
         }
 
         this.index += 1;

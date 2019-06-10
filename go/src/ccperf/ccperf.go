@@ -14,13 +14,15 @@ import (
 	pb "github.com/hyperledger/fabric/protos/peer"
 )
 
-type log struct {}
-func (l log) Debug(v ...interface{}) {}
+type log struct{}
+
+func (l log) Debug(v ...interface{})                 {}
 func (l log) Debugf(format string, v ...interface{}) {}
-func (l log) Info(v ...interface{}) { fmt.Println(v...) }
-func (l log) Infof(format string, v ...interface{}) { fmt.Printf(format, v...) }
-func (l log) Error(v ...interface{}) { fmt.Fprint(os.Stderr, v...) }
-func (l log) Errorf(format string, v ...interface{}) { fmt.Fprintf(os.Stderr, format, v...)  }
+func (l log) Info(v ...interface{})                  { fmt.Println(v...) }
+func (l log) Infof(format string, v ...interface{})  { fmt.Printf(format, v...) }
+func (l log) Error(v ...interface{})                 { fmt.Fprint(os.Stderr, v...) }
+func (l log) Errorf(format string, v ...interface{}) { fmt.Fprintf(os.Stderr, format, v...) }
+
 var logger log
 
 // CCPerf
@@ -71,6 +73,8 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return ccperf.runMix(stub, args)
 	case "json":
 		return ccperf.runJSON(stub, args)
+	case "contended":
+		return ccperf.runContended(stub, args)
 	case "invoke_chaincode":
 		return ccperf.runInvokeChaincode(stub, args)
 	case "floating_point":
@@ -84,7 +88,7 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 
 func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 3, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -109,7 +113,7 @@ func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []strin
 
 	buffer, ok := ccperf.buffers[size]
 	if !ok {
-		msg := fmt.Sprintf("Incorrenct buffer size specified.　Recieved %d", size)
+		msg := fmt.Sprintf("Incorrect buffer size specified.　received %d", size)
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -128,7 +132,7 @@ func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []strin
 
 func (ccperf *CCPerf) runPutState(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 3, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -149,7 +153,7 @@ func (ccperf *CCPerf) runPutState(stub shim.ChaincodeStubInterface, args []strin
 
 	buffer, ok := ccperf.buffers[size]
 	if !ok {
-		msg := fmt.Sprintf("Incorrenct buffer size specified.　Recieved %d", size)
+		msg := fmt.Sprintf("Incorrect buffer size specified.　received %d", size)
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -167,7 +171,7 @@ func (ccperf *CCPerf) runPutState(stub shim.ChaincodeStubInterface, args []strin
 
 func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 3, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -205,10 +209,15 @@ func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []strin
 	for i := 0; i < num; i++ {
 		key := "DATAKEY_" + strconv.Itoa((base+401*i)%max)
 		logger.Debugf("GetState(%s)", key)
-		_, err = stub.GetState(key)
+		val, err := stub.GetState(key)
 		if err != nil {
 			logger.Error(err.Error())
 			return shim.Error(err.Error())
+		}
+		if val == nil {
+			msg := fmt.Sprintf("GetState failed for key %s", key)
+			logger.Error(msg)
+			return shim.Error(msg)
 		}
 	}
 
@@ -217,7 +226,7 @@ func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []strin
 
 func (ccperf *CCPerf) runRangeQuery(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 3, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -260,7 +269,7 @@ func (ccperf *CCPerf) runRangeQuery(stub shim.ChaincodeStubInterface, args []str
 
 func (ccperf *CCPerf) runMix(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 4 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 4, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -290,7 +299,7 @@ type jsonDataType struct {
 
 func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 4 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 4, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -342,9 +351,69 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 	return ccperf.runPutState(stub, putArgs)
 }
 
+func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 4 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
+		logger.Error(msg)
+		return shim.Error(msg)
+	}
+
+	num, err := strconv.Atoi(args[0])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	max, err := strconv.Atoi(args[3])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	base := 0
+	flag := false
+	s := strings.Split(args[2], "_")
+	if len(s) == 2 {
+		x1, err1 := strconv.Atoi(s[0])
+		x2, err2 := strconv.Atoi(s[1])
+		if err1 == nil && err2 == nil {
+			base = 100207*x1 + 3001*x2
+			flag = true
+		}
+	}
+	if !flag {
+		msg := fmt.Sprintf("Invalid key format: %s", args[2])
+		logger.Error(msg)
+		return shim.Error(msg)
+	}
+
+	for i := 0; i < num; i++ {
+		key := "DATAKEY_" + strconv.Itoa((base+401*i)%max)
+		logger.Debugf("GetState(%s)", key)
+		val, err := stub.GetState(key)
+		if err != nil {
+			logger.Error(err.Error())
+			return shim.Error(err.Error())
+		}
+		if val == nil {
+			msg := fmt.Sprintf("GetState failed for key %s", key)
+			logger.Error(msg)
+			return shim.Error(msg)
+		}
+
+		err = stub.PutState(key, val)
+		if err != nil {
+			logger.Error(err.Error())
+			return shim.Error(err.Error())
+		}
+	}
+
+	return shim.Success(nil)
+}
+
 func (ccperf *CCPerf) runInvokeChaincode(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 2 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 2, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 2, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -377,7 +446,7 @@ func (ccperf *CCPerf) runInvokeChaincode(stub shim.ChaincodeStubInterface, args 
 
 func (ccperf *CCPerf) runEmpty(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 0 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 0, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 0, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -387,7 +456,7 @@ func (ccperf *CCPerf) runEmpty(stub shim.ChaincodeStubInterface, args []string) 
 
 func (ccperf *CCPerf) runFloatingPoint(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 1 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 1, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 1, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -411,7 +480,7 @@ func (ccperf *CCPerf) runFloatingPoint(stub shim.ChaincodeStubInterface, args []
 
 func (ccperf *CCPerf) runAllocation(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 2 {
-		msg := fmt.Sprintf("Incorrenct number of arguments. Expecting 2, recieved %d", len(args))
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 2, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
