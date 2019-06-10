@@ -118,6 +118,17 @@ func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []strin
 		return shim.Error(msg)
 	}
 
+	maxKey := "DATAKEY_" + strconv.Itoa(num-1)
+	val, err := stub.GetState(maxKey)
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+	if val != nil && len(val) == size {
+		logger.Infof("Already populated. num=%d, size=%d\n", num, size)
+		return shim.Success(nil)
+	}
+
 	for i := start; i < num; i++ {
 		key := "DATAKEY_" + strconv.Itoa(i)
 		err = stub.PutState(key, buffer)
@@ -126,6 +137,8 @@ func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []strin
 			return shim.Error(err.Error())
 		}
 	}
+
+	logger.Infof("Populated. num=%d, size=%d\n", num, size)
 
 	return shim.Success(nil)
 }
@@ -352,8 +365,8 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 }
 
 func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 4 {
-		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
+	if len(args) != 3 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -364,7 +377,7 @@ func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []stri
 		return shim.Error(err.Error())
 	}
 
-	max, err := strconv.Atoi(args[3])
+	max, err := strconv.Atoi(args[2])
 	if err != nil {
 		logger.Error(err.Error())
 		return shim.Error(err.Error())
@@ -372,7 +385,7 @@ func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []stri
 
 	base := 0
 	flag := false
-	s := strings.Split(args[2], "_")
+	s := strings.Split(args[1], "_")
 	if len(s) == 2 {
 		x1, err1 := strconv.Atoi(s[0])
 		x2, err2 := strconv.Atoi(s[1])
@@ -389,7 +402,7 @@ func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []stri
 
 	for i := 0; i < num; i++ {
 		key := "DATAKEY_" + strconv.Itoa((base+401*i)%max)
-		logger.Debugf("GetState(%s)", key)
+		logger.Debugf("GetState(%s)\n", key)
 		val, err := stub.GetState(key)
 		if err != nil {
 			logger.Error(err.Error())

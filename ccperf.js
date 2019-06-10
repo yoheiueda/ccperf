@@ -155,6 +155,7 @@ async function populate(config, channel) {
     await channel.sendTransaction(orderer_request);
 
     await p;
+
     eventhub.disconnect();
 }
 
@@ -808,7 +809,7 @@ class DefaultChaincodeTxPlugin {
             'rangequery': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
             'mix': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
             'json': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
-            'contended': context => [String(context.config.num), String(context.config.size), util.format('%d_%d', context.workerID, context.index), String(context.config.population)],
+            'contended': context => [String(context.config.num), util.format('%d_%d', context.workerID, context.index), String(context.config.population)],
         }
     }
 
@@ -928,6 +929,7 @@ class Worker {
                     const txid = msg.tx.txid;
                     const event = this.eventTable.get(txid);
                     this.eventTable.delete(txid);
+                    msg.requestArgs = event.requestArgs;
                     event.occurredResolve(msg);
                 }
             });
@@ -955,6 +957,7 @@ class Worker {
         while (true) {
             const before = Date.now();
 
+            this.index += 1;
             this.execute();
 
             const after = Date.now();
@@ -1086,6 +1089,8 @@ class Worker {
 
                     eventPromise = new Promise(resolve => {
                         worker.eventTable.set(tx_id.getTransactionID(), {
+                            requestFcn: request.fcn,
+                            requestArgs: request.args,
                             occurredResolve: resolve
                         });
                     });
@@ -1115,16 +1120,14 @@ class Worker {
             }
 
             if (this.retry) {
-                const msg = await eventPromise;
-                if (msg.tx.tx_validation_code != 'VALID') {
-                    //console.log('msg.tx_validation_code=', msg.tx.tx_validation_code);
+                const event = await eventPromise;
+                if (event.tx.tx_validation_code != 'VALID') {
+                    //console.log('msg.tx_validation_code: %s, args: %j', event.tx.tx_validation_code, event.requestArgs);
                     continue;
                 }
             }
             break
         }
-
-        this.index += 1;
     }
 }
 
