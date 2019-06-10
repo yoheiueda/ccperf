@@ -227,12 +227,12 @@ class LocalDriver {
     async init(config) {
         this.config = config;
         const driver = this;
+        const numProcesses = this.config.processes;
         const completionPromises = [];
         const exitedPromises = [];
-        const numProcesses = this.config.processes / this.config.remotes.length;
         const initAckPromises = [];
 
-        for (var i = 0; i < numProcesses; i++) {
+        for (var i = 0; i < config.asignedProcesses; i++) {
             this.config.delay = i * this.config.rampup / numProcesses;
             const w = cluster.fork();
             w.on('online', () => {
@@ -280,7 +280,7 @@ class LocalDriver {
         this.completionPromise = Promise.all(completionPromises);
         this.exitedPromise = Promise.all(exitedPromises);
 
-        console.log('Started %d workers', numProcesses);
+        console.log('Started %d workers', config.asignedProcesses);
 
         return Promise.all(initAckPromises);;
     }
@@ -376,11 +376,10 @@ class LocalDriver {
 
 
 class RemoteDriver {
-    constructor(remote) {
+    constructor(hostport) {
         this.handlers = {};
-        const hostport = remote.split(':');
-        const host = hostport[0];
-        const port = Number(hostport[1]);
+        const [host, portstr] = hostport.split(':');
+        const port = Number(portstr);
         this.url = `ws://${host}:${port}`;
     }
 
@@ -711,16 +710,21 @@ class Master {
         this.drivers = [];
 
         for (const remote of config.remotes) {
+            let [hostport, processes] = remote.split('/');
             let driver;
-            if (remote === "local") {
+            if (hostport === "local") {
                 //console.log('Creating local driver');
                 driver = new LocalDriver();
 
             } else {
-                driver = new RemoteDriver(remote);
+                driver = new RemoteDriver(hostport);
             }
-
-            await driver.init(config);
+            if (processes === undefined) {
+                 processes = config.processes / config.remotes.length;
+            }
+            const driverConfig = Object.assign({}, config);
+            driverConfig.asignedProcesses = processes;
+            await driver.init(driverConfig);
             this.drivers.push(driver);
         }
 
@@ -1128,7 +1132,7 @@ function run(cmd) {
         rampdown: 5,
         remotes: remotes
     };
-
+    //console.log('config=%j', config);
     const master = new Master(config);
 
     master.start().catch(err => {
