@@ -99,6 +99,7 @@ services:
       - CORE_VM_ENDPOINT=unix:///host/var/run/docker.sock
       - CORE_VM_DOCKER_HOSTCONFIG_NETWORKMODE=${COMPOSE_PROJECT_NAME}_{{ network }}
       - CORE_CHAINCODE_BUILDER=hyperledger/fabric-ccenv:${FABRIC_TAG}
+      - CORE_CHAINCODE_GOLANG_RUNTIME=hyperledger/fabric-baseos:${FABRIC_TAG}
       - CORE_PEER_TLS_ENABLED=${CORE_PEER_TLS_ENABLED}
       - CORE_PEER_TLS_CERT_FILE=/etc/hyperledger/fabric/tls/server.crt
       - CORE_PEER_TLS_KEY_FILE=/etc/hyperledger/fabric/tls/server.key

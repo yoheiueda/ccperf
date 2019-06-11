@@ -33,8 +33,7 @@ rm -f .build/goshim.tar.bz2
 
 make_targets=$(echo $targets | sed -E 's/(peer|orderer|tools)/\1-docker/g')
 
-make BASEIMAGE_RELEASE="$base" $make_targets || exit 1
-#make $make_targets || exit 1
+make $make_targets || exit 1
 
 for t in $targets; do
   if [[ "$t" = native ]]; then
