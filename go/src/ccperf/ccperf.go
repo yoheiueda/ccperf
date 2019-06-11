@@ -20,7 +20,7 @@ func (l log) Debug(v ...interface{})                 {}
 func (l log) Debugf(format string, v ...interface{}) {}
 func (l log) Info(v ...interface{})                  { fmt.Println(v...) }
 func (l log) Infof(format string, v ...interface{})  { fmt.Printf(format, v...) }
-func (l log) Error(v ...interface{})                 { fmt.Fprint(os.Stderr, v...) }
+func (l log) Error(v ...interface{})                 { fmt.Fprintln(os.Stderr, v...) }
 func (l log) Errorf(format string, v ...interface{}) { fmt.Fprintf(os.Stderr, format, v...) }
 
 var logger log
