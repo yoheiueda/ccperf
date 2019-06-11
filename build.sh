@@ -44,8 +44,7 @@ for t in $targets; do
   id=$(docker image ls --format '{{ .ID }}' "hyperledger/fabric-$t:latest" )
   docker tag "hyperledger/fabric-$t:latest" "hyperledger/fabric-$t:$tag"
   if [[ -n "$id" ]]; then
-    #docker image ls --format '{{ .ID }} {{ .Repository }} {{ .Tag }}' | awk "\$1 == \"$id\" && \$3 != \"$tag\" { print(\$2 \":\" \$3) }" | xargs $(xargs --version > /dev/null 2>&1 && echo -e --no-run-if-empty) docker image rm
-    docker image ls --format '{{ .ID }} {{ .Repository }} {{ .Tag }}' | awk "\$1 == \"$id\" && \$3 != \"$tag\" && ( \$3 == \"latest\" || \$3 ~ /snapshot/) { print(\$2 \":\" \$3) }" | xargs $(xargs --version > /dev/null 2>&1 && echo -e --no-run-if-empty) docker image rm
+    docker image ls --format '{{ .ID }} {{ .Repository }} {{ .Tag }}' | awk "\$1 == \"$id\" && \$3 != \"$tag\" && ( \$3 == \"latest\" || \$3 ~ /snapshot/ || \$3 == \"2.0.0\") { print(\$2 \":\" \$3) }" | xargs $(xargs --version > /dev/null 2>&1 && echo -e --no-run-if-empty) docker image rm
 
   fi
 done
