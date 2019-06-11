@@ -830,6 +830,13 @@ class DefaultChaincodeTxPlugin {
     }
 
     getTxHandler(txType) {
+        if (txType == "composite") {
+            if (cluster.worker.id % 2 == 0) {
+                txType = 'json';
+            } else {
+                txType = 'rangequery';
+            }
+        }
         const handler = {
             chaincodeId: this.getChaincodeId(),
             isQuery: false,
