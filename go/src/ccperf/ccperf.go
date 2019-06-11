@@ -365,43 +365,8 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 }
 
 func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
-		logger.Error(msg)
-		return shim.Error(msg)
-	}
-
-	num, err := strconv.Atoi(args[0])
-	if err != nil {
-		logger.Error(err.Error())
-		return shim.Error(err.Error())
-	}
-
-	max, err := strconv.Atoi(args[2])
-	if err != nil {
-		logger.Error(err.Error())
-		return shim.Error(err.Error())
-	}
-
-	base := 0
-	flag := false
-	s := strings.Split(args[1], "_")
-	if len(s) == 2 {
-		x1, err1 := strconv.Atoi(s[0])
-		x2, err2 := strconv.Atoi(s[1])
-		if err1 == nil && err2 == nil {
-			base = 100207*x1 + 3001*x2
-			flag = true
-		}
-	}
-	if !flag {
-		msg := fmt.Sprintf("Invalid key format: %s", args[2])
-		logger.Error(msg)
-		return shim.Error(msg)
-	}
-
-	for i := 0; i < num; i++ {
-		key := "DATAKEY_" + strconv.Itoa((base+401*i)%max)
+	for _, arg := range args {
+		key := "DATAKEY_" + arg
 		logger.Debugf("GetState(%s)\n", key)
 		val, err := stub.GetState(key)
 		if err != nil {
@@ -413,14 +378,12 @@ func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []stri
 			logger.Error(msg)
 			return shim.Error(msg)
 		}
-
 		err = stub.PutState(key, val)
 		if err != nil {
 			logger.Error(err.Error())
 			return shim.Error(err.Error())
 		}
 	}
-
 	return shim.Success(nil)
 }
 

@@ -800,6 +800,14 @@ class Master {
     }
 }
 
+function randomIntArgs(n, min, max) {
+    const args = [];
+    for (let i = 0; i < n; i++) {
+        args.push(String(min + Math.floor(Math.random() * (max - min))))
+    }
+    return args
+}
+
 class DefaultChaincodeTxPlugin {
     constructor() {
         this._chaincodeId = 'ccperf';
@@ -809,7 +817,7 @@ class DefaultChaincodeTxPlugin {
             'rangequery': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
             'mix': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
             'json': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
-            'contended': context => [String(context.config.num), util.format('%d_%d', context.workerID, context.index), String(context.config.population)],
+            'contended': context => randomIntArgs(context.config.num, 0, context.config.population - 1),
         }
     }
 
