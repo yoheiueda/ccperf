@@ -69,6 +69,8 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return ccperf.runGetState(stub, args)
 	case "rangequery":
 		return ccperf.runRangeQuery(stub, args)
+	case "rangequeryupdate":
+		return ccperf.runRangeQueryUpdate(stub, args)
 	case "mix":
 		return ccperf.runMix(stub, args)
 	case "json":
@@ -84,6 +86,10 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 	msg := fmt.Sprintf("Unknown function name: %s", function)
 	logger.Error(msg)
 	return shim.Error(msg)
+}
+
+func getDatakey(i int) string {
+	return fmt.Sprintf("DATAKEY_%010d", i)
 }
 
 func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []string) pb.Response {
@@ -118,7 +124,7 @@ func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []strin
 		return shim.Error(msg)
 	}
 
-	maxKey := "DATAKEY_" + strconv.Itoa(num-1)
+	maxKey := getDatakey(num - 1)
 	val, err := stub.GetState(maxKey)
 	if err != nil {
 		logger.Error(err.Error())
@@ -129,13 +135,14 @@ func (ccperf *CCPerf) runPopulate(stub shim.ChaincodeStubInterface, args []strin
 		return shim.Success(nil)
 	}
 
-	for i := start; i < num; i++ {
-		key := "DATAKEY_" + strconv.Itoa(i)
+	for i := 0; i < num; i++ {
+		key := getDatakey(start + i)
 		err = stub.PutState(key, buffer)
 		if err != nil {
 			logger.Error(err.Error())
 			return shim.Error(err.Error())
 		}
+		logger.Debugf("Data key=%s stored\n", key)
 	}
 
 	logger.Infof("Populated. num=%d, size=%d\n", num, size)
@@ -220,7 +227,7 @@ func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []strin
 	}
 
 	for i := 0; i < num; i++ {
-		key := "DATAKEY_" + strconv.Itoa((base+401*i)%max)
+		key := getDatakey((base + 401*i) % max)
 		logger.Debugf("GetState(%s)", key)
 		val, err := stub.GetState(key)
 		if err != nil {
@@ -238,8 +245,8 @@ func (ccperf *CCPerf) runGetState(stub shim.ChaincodeStubInterface, args []strin
 }
 
 func (ccperf *CCPerf) runRangeQuery(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 3 {
-		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 3, received %d", len(args))
+	if len(args) != 2 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 2, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -257,14 +264,16 @@ func (ccperf *CCPerf) runRangeQuery(stub shim.ChaincodeStubInterface, args []str
 	}
 
 	for i := 0; i < num; i++ {
-		maxKey := "DATAKEY_" + strconv.Itoa(max-1)
-		logger.Debugf("GetStateByRange(\"DATEKEY_\", %s)", maxKey)
-		iter, err := stub.GetStateByRange("DATEKEY_", maxKey)
+		minKey := getDatakey(0)
+		maxKey := getDatakey(max)
+		logger.Debugf("GetStateByRange(\"%s\", \"%s\")\n", minKey, maxKey)
+		iter, err := stub.GetStateByRange(minKey, maxKey)
 		if err != nil {
 			logger.Error(err.Error())
 			return shim.Error(err.Error())
 		}
 
+		count := 0
 		for iter.HasNext() {
 			kv, err := iter.Next()
 			if err != nil {
@@ -273,7 +282,77 @@ func (ccperf *CCPerf) runRangeQuery(stub shim.ChaincodeStubInterface, args []str
 			}
 			key := kv.Key
 			value := kv.Value
-			logger.Debugf("key=%s, value=%s", key, value)
+			logger.Debugf("key=%s, value=%s\n", key, value)
+			count++
+		}
+		logger.Debugf("query result count=%d\n", count)
+	}
+
+	return shim.Success(nil)
+}
+
+func (ccperf *CCPerf) runRangeQueryUpdate(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) != 4 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
+		logger.Error(msg)
+		return shim.Error(msg)
+	}
+
+	num, err := strconv.Atoi(args[0])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	size, err := strconv.Atoi(args[1])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	key := args[2]
+
+	max, err := strconv.Atoi(args[3])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	minKey := getDatakey(0)
+	maxKey := getDatakey(max)
+	logger.Debugf("GetStateByRange(\"%s\", \"%s\")\n", minKey, maxKey)
+	iter, err := stub.GetStateByRange(minKey, maxKey)
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	count := 0
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			logger.Error(err.Error())
+			return shim.Error(err.Error())
+		}
+		key := kv.Key
+		value := kv.Value
+		logger.Debugf("key=%s, value=%s\n", key, value)
+		count++
+	}
+	logger.Debugf("query result count=%d\n", count)
+
+	buffer, ok := ccperf.buffers[size]
+	if !ok {
+		msg := fmt.Sprintf("Incorrect buffer size specified.　received %d", size)
+		logger.Error(msg)
+		return shim.Error(msg)
+	}
+
+	for i := 0; i < num; i++ {
+		err = stub.PutState(key+"_"+strconv.Itoa(i), buffer)
+		if err != nil {
+			logger.Error(err.Error())
+			return shim.Error(err.Error())
 		}
 	}
 
@@ -366,7 +445,12 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 
 func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	for _, arg := range args {
-		key := "DATAKEY_" + arg
+		i, err := strconv.Atoi(arg)
+		if err != nil {
+			logger.Error(err.Error())
+			return shim.Error(err.Error())
+		}
+		key := getDatakey(i)
 		logger.Debugf("GetState(%s)\n", key)
 		val, err := stub.GetState(key)
 		if err != nil {
