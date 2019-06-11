@@ -1,3 +1,274 @@
+commit 7f862a66e65953c2925102556f3ecdd88181c0ae
+Author: Yohei Ueda <yohei@jp.ibm.com>
+Date:   Tue Jun 4 18:32:57 2019 +0900
+
+    Support protobuf
+    
+    Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
+    Change-Id: Ibde43707e70449c018511713f530dfd442464506
+
+diff --git a/src/runtime/chan.go b/src/runtime/chan.go
+index 89733d043d..9ed40b539b 100644
+--- a/src/runtime/chan.go
++++ b/src/runtime/chan.go
+@@ -303,7 +303,7 @@ func send(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+ 	if sg.releasetime != 0 {
+ 		sg.releasetime = cputicks()
+ 	}
+-	wakeupevent(sg.blocktime, gp, 2)
++	wakeupevent(sg.blocktime, gp, 2, "chan")
+ 	goready(gp, skip+1)
+ }
+ 
+@@ -379,7 +379,7 @@ func closechan(c *hchan) {
+ 			raceacquireg(gp, c.raceaddr())
+ 		}
+ 		glist.push(gp)
+-		wakeupevent(sg.blocktime, gp, 2)
++		wakeupevent(sg.blocktime, gp, 2, "chan")
+ 	}
+ 
+ 	// release all writers (they will panic)
+@@ -398,7 +398,7 @@ func closechan(c *hchan) {
+ 			raceacquireg(gp, c.raceaddr())
+ 		}
+ 		glist.push(gp)
+-		wakeupevent(sg.blocktime, gp, 2)
++		wakeupevent(sg.blocktime, gp, 2, "chan")
+ 	}
+ 	unlock(&c.lock)
+ 
+@@ -609,7 +609,7 @@ func recv(c *hchan, sg *sudog, ep unsafe.Pointer, unlockf func(), skip int) {
+ 	if sg.releasetime != 0 {
+ 		sg.releasetime = cputicks()
+ 	}
+-	wakeupevent(sg.blocktime, gp, 2)
++	wakeupevent(sg.blocktime, gp, 2, "chan")
+ 	goready(gp, skip+1)
+ }
+ 
+diff --git a/src/runtime/mprof.go b/src/runtime/mprof.go
+index c473df8c69..b91662a6c1 100644
+--- a/src/runtime/mprof.go
++++ b/src/runtime/mprof.go
+@@ -143,6 +143,7 @@ type blockRecord struct {
+ type wakeupRecord struct {
+ 	blockRecord
+ 	nstkNotifier, nstkWaiter int
++	event                    string
+ }
+ 
+ var (
+@@ -504,7 +505,7 @@ func SetWakeupProfileFraction(rate int) int {
+ 	return int(old)
+ }
+ 
+-func wakeupevent(blocktime int64, gpWaiter *g, skip int) {
++func wakeupevent(blocktime int64, gpWaiter *g, skip int, event string) {
+ 	rate := uint64(atomic.Load64(&wakeupprofilerate))
+ 	if rate == 0 {
+ 		return
+@@ -515,11 +516,11 @@ func wakeupevent(blocktime int64, gpWaiter *g, skip int) {
+ 		if blocktime > 0 {
+ 			cycles = cputicks() - blocktime
+ 		}
+-		savewakeupevent(cycles, gpWaiter, skip)
++		savewakeupevent(cycles, gpWaiter, skip, event)
+ 	}
+ }
+ 
+-func savewakeupevent(cycles int64, gpWaiter *g, skip int) {
++func savewakeupevent(cycles int64, gpWaiter *g, skip int, event string) {
+ 	var nstkNotifier, nstkWaiter int
+ 	var stkNotifier, stkWaiter [maxStack]uintptr
+ 	var crtNotifier, crtWaiter uintptr
+@@ -545,6 +546,7 @@ func savewakeupevent(cycles int64, gpWaiter *g, skip int) {
+ 	wp.count++
+ 	wp.nstkNotifier = nstkNotifier
+ 	wp.nstkWaiter = nstkWaiter
++	wp.event = event
+ 	unlock(&proflock)
+ }
+ 
+@@ -909,6 +911,7 @@ type WakeupProfileRecord struct {
+ 	Cycles   int64
+ 	Waiter   StackRecordWithCreator
+ 	Notifier StackRecordWithCreator
++	Event    string
+ }
+ 
+ // StackRecordWithCreator is a stack trace with an additional creation site
+@@ -936,6 +939,7 @@ func WakeupProfile(p []WakeupProfileRecord) (n int, ok bool) {
+ 			r := &p[0]
+ 			r.Count = int64(wp.count)
+ 			r.Cycles = wp.cycles
++			r.Event = wp.event
+ 			start := 0
+ 			i := copy(r.Notifier.Stack0[:], b.stk()[start:start+wp.nstkNotifier])
+ 			for ; i < len(r.Notifier.Stack0); i++ {
+diff --git a/src/runtime/netpoll.go b/src/runtime/netpoll.go
+index 68531752e9..aa53a3bc56 100644
+--- a/src/runtime/netpoll.go
++++ b/src/runtime/netpoll.go
+@@ -356,7 +356,7 @@ func netpollblockcommit(gp *g, gpp unsafe.Pointer) bool {
+ 
+ func netpollgoready(gp *g, traceskip int) {
+ 	atomic.Xadd(&netpollWaiters, -1)
+-	wakeupevent(0, gp, 2)
++	wakeupevent(0, gp, 2, "netpoll")
+ 	goready(gp, traceskip+1)
+ }
+ 
+diff --git a/src/runtime/pprof/pprof.go b/src/runtime/pprof/pprof.go
+index 72a31f17a8..d175440da1 100644
+--- a/src/runtime/pprof/pprof.go
++++ b/src/runtime/pprof/pprof.go
+@@ -936,6 +936,85 @@ func scaleMutexProfile(cnt int64, ns float64) (int64, float64) {
+ 
+ func runtime_cyclesPerSecond() int64
+ 
++func getDummyLocation(b *profileBuilder) uint64 {
++	dummyAddr := uintptr(0)
++	dummyName := "<waker>"
++
++	if b.locs[dummyAddr] != 0 {
++		return uint64(b.locs[dummyAddr])
++	}
++
++	dummyID := uint64(len(b.locs)) + 1
++	b.locs[dummyAddr] = int(dummyID)
++
++	start := b.pb.startMessage()
++	b.pb.uint64Opt(tagLocation_ID, dummyID)
++	b.pb.uint64Opt(tagLocation_Address, uint64(dummyAddr))
++	dummyFuncID := uint64(len(b.funcs)) + 1
++	b.funcs[dummyName] = int(dummyFuncID)
++	b.pbLine(tagLocation_Line, dummyFuncID, int64(0))
++	b.pb.endMessage(tagProfile_Location, start)
++
++	start2 := b.pb.startMessage()
++	b.pb.uint64Opt(tagFunction_ID, dummyFuncID)
++	b.pb.int64Opt(tagFunction_Name, b.stringIndex(dummyName))
++	b.pb.endMessage(tagProfile_Function, start2)
++
++	return dummyID
++}
++
++// printWakeupProfile outputs wakeup profile records
++func printWakeupProfile(w io.Writer, countName, cycleName string, records []runtime.WakeupProfileRecord) error {
++	// Output profile in protobuf form.
++	b := newProfileBuilder(w)
++	b.pbValueType(tagProfile_PeriodType, countName, "count")
++	b.pb.int64Opt(tagProfile_Period, 1)
++	b.pbValueType(tagProfile_SampleType, countName, "count")
++	b.pbValueType(tagProfile_SampleType, cycleName, "nanoseconds")
++
++	cpuGHz := float64(runtime_cyclesPerSecond()) / 1e9
++
++	dummyID := getDummyLocation(b)
++
++	values := []int64{0, 0}
++	var locs []uint64
++
++	for _, r := range records {
++		//var numWaiterFrames int64
++		values[0] = r.Count
++		values[1] = int64(float64(r.Cycles) / cpuGHz)
++		locs = locs[:0]
++		for _, addr := range r.Waiter.Stack() {
++			// For count profiles, all stack addresses are
++			// return PCs, which is what locForPC expects.
++			l := b.locForPC(addr)
++			if l == 0 { // runtime.goexit
++				continue
++			}
++			locs = append(locs, l)
++			//numWaiterFrames++
++		}
++
++		locs = append(locs, dummyID)
++
++		for _, addr := range r.Notifier.Stack() {
++			// For count profiles, all stack addresses are
++			// return PCs, which is what locForPC expects.
++			l := b.locForPC(addr)
++			if l == 0 { // runtime.goexit
++				continue
++			}
++			locs = append(locs, l)
++		}
++		b.pbSample(values, locs, func() {
++			//b.pbLabel(tagSample_Label, "waiterFrames", "", numWaiterFrames)
++			b.pbLabel(tagSample_Label, "eventType", r.Event, 0)
++		})
++	}
++	b.build()
++	return nil
++}
++
+ // countWakeup returns the number of records in the wakeup profile.
+ func countWakeup() int {
+ 	n, _ := runtime.WakeupProfile(nil)
+@@ -959,6 +1038,10 @@ func writeWakeup(w io.Writer, debug int) error {
+ 		return p[i].Cycles > p[j].Cycles || (p[i].Cycles == p[j].Cycles && p[i].Count > p[j].Count)
+ 	})
+ 
++	if debug <= 0 {
++		return printWakeupProfile(w, "wakeups", "delay", p)
++	}
++
+ 	b := bufio.NewWriter(w)
+ 	var tw *tabwriter.Writer
+ 	w = b
+diff --git a/src/runtime/proc.go b/src/runtime/proc.go
+index a5a30acfd9..67e2678ee9 100644
+--- a/src/runtime/proc.go
++++ b/src/runtime/proc.go
+@@ -3345,7 +3345,7 @@ func newproc1(fn *funcval, argp *uint8, narg int32, callergp *g, callerpc uintpt
+ 	if trace.enabled {
+ 		traceGoCreate(newg, newg.startpc)
+ 	}
+-	wakeupevent(0, newg, 1)
++	wakeupevent(0, newg, 1, "proc")
+ 	runqput(_p_, newg, true)
+ 
+ 	if atomic.Load(&sched.npidle) != 0 && atomic.Load(&sched.nmspinning) == 0 && mainStarted {
+diff --git a/src/runtime/sema.go b/src/runtime/sema.go
+index 3ef6733319..678131fb18 100644
+--- a/src/runtime/sema.go
++++ b/src/runtime/sema.go
+@@ -80,7 +80,7 @@ func readyWithTime(s *sudog, traceskip int) {
+ 	if s.releasetime != 0 {
+ 		s.releasetime = cputicks()
+ 	}
+-	wakeupevent(s.blocktime, s.g, 2)
++	wakeupevent(s.blocktime, s.g, 2, "sema")
+ 	goready(s.g, traceskip)
+ }
+ 
+diff --git a/src/runtime/time.go b/src/runtime/time.go
+index cdb8c70c56..6be5f44629 100644
+--- a/src/runtime/time.go
++++ b/src/runtime/time.go
+@@ -125,7 +125,7 @@ func stopTimer(t *timer) bool {
+ 
+ // Ready the goroutine arg.
+ func goroutineReady(arg interface{}, seq uintptr) {
+-	wakeupevent(0, arg.(*g), 2)
++	wakeupevent(0, arg.(*g), 2, "time")
+ 	goready(arg.(*g), 0)
+ }
+ 
+@@ -163,7 +163,7 @@ func (tb *timersBucket) addtimerLocked(t *timer) bool {
+ 		}
+ 		if tb.rescheduling {
+ 			tb.rescheduling = false
+-			wakeupevent(0, tb.gp, 2)
++			wakeupevent(0, tb.gp, 2, "time")
+ 			goready(tb.gp, 0)
+ 		}
+ 		if !tb.created {
+
 commit d88b29badd2d32b1ddf695b998f00661a91c38bd
 Author: Yohei Ueda <yohei@jp.ibm.com>
 Date:   Thu May 30 16:28:31 2019 +0900
