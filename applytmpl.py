@@ -96,6 +96,9 @@ data = {
     }
 }
 
+if genJSON:
+    data['embedKeys'] = False
+
 out = tpl.render(data)
 
 if genJSON:
