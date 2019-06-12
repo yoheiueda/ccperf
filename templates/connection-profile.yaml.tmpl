@@ -27,16 +27,28 @@ organizations:
       - {{ peer.name }}.{{ org.domain }}
     {%- endfor %}
     adminPrivateKey:
+      {% if embedKeys -%}
+      pem:  {{ org | findsk | readpem }}
+      {%- else -%}
       path: {{ org | findsk }}
+    　{%- endif %}
     signedCert:
+      {% if embedKeys -%}
+      pem: {{ ("crypto-config/peerOrganizations/" + org.domain + "/users/Admin@" + org.domain + "/msp/signcerts/Admin@" + org.domain +　"-cert.pem") | readpem }}
+      {%- else -%}
       path: crypto-config/peerOrganizations/{{ org.domain }}/users/Admin@{{ org.domain }}/msp/signcerts/Admin@{{ org.domain }}-cert.pem
+      {%- endif %}
 {% endfor %}
 orderers:
 {%- for orderer in ordererorg.orderers %}
   {{ orderer.name }}.{{ ordererorg.domain }}:
     url: 'grpcs://{{ orderer.host }}:{{ orderer.ports.requests }}'
     tlsCACerts:
+      {% if embedKeys -%}
+      pem:  {{ ("crypto-config/ordererOrganizations/" + ordererorg.domain + "/orderers/" + orderer.name + "." + ordererorg.domain + "/msp/tlscacerts/tlsca." + ordererorg.domain + "-cert.pem") | readpem }}
+      {%- else -%}
       path: crypto-config/ordererOrganizations/{{ ordererorg.domain }}/orderers/{{ orderer.name }}.{{ ordererorg.domain }}/msp/tlscacerts/tlsca.{{ ordererorg.domain }}-cert.pem
+      {%- endif %}
     grpcOptions:
       ssl-target-name-override: {{ orderer.name }}.{{ ordererorg.domain }}
       grpc-wait-for-ready-timeout: 10000
@@ -48,8 +60,15 @@ peers:
   {{ peer.name }}.{{ org.domain }}:
     url: 'grpcs://{{ peer.host }}:{{ peer.ports.requests }}'
     tlsCACerts:
+      {% if embedKeys -%}
+      pem:  {{ ("crypto-config/peerOrganizations/" + org.domain + "/peers/" + peer.name +"." + org.domain + "/msp/tlscacerts/tlsca." + org.domain + "-cert.pem") | readpem }}
+      {%- else -%}
       path: crypto-config/peerOrganizations/{{ org.domain }}/peers/{{ peer.name }}.{{ org.domain }}/msp/tlscacerts/tlsca.{{ org.domain }}-cert.pem
+      {%- endif %}
     grpcOptions:
       ssl-target-name-override: {{ peer.name }}.{{ org.domain }}
 {% endfor -%}
 {% endfor %}
+
+client:
+  organization: {{ client.org }}
