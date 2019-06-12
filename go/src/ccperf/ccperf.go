@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -69,7 +70,7 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return ccperf.runGetState(stub, args)
 	case "rangequery":
 		return ccperf.runRangeQuery(stub, args)
-	case "rangequeryupdate":
+	case "rangequery_update":
 		return ccperf.runRangeQueryUpdate(stub, args)
 	case "mix":
 		return ccperf.runMix(stub, args)
@@ -79,8 +80,10 @@ func (ccperf *CCPerf) Invoke(stub shim.ChaincodeStubInterface) pb.Response {
 		return ccperf.runContended(stub, args)
 	case "invoke_chaincode":
 		return ccperf.runInvokeChaincode(stub, args)
+	case "hash":
+		return ccperf.runHash(stub, args)
 	case "floating_point":
-		return ccperf.runPutState(stub, args)
+		return ccperf.runFloatingPoint(stub, args)
 	}
 
 	msg := fmt.Sprintf("Unknown function name: %s", function)
@@ -472,6 +475,37 @@ func (ccperf *CCPerf) runContended(stub shim.ChaincodeStubInterface, args []stri
 }
 
 func (ccperf *CCPerf) runInvokeChaincode(stub shim.ChaincodeStubInterface, args []string) pb.Response {
+	if len(args) < 2 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting more than 1, received %d", len(args))
+		logger.Error(msg)
+		return shim.Error(msg)
+	}
+
+	num, err := strconv.Atoi(args[0])
+	if err != nil {
+		logger.Error(err.Error())
+		return shim.Error(err.Error())
+	}
+
+	chaincodeName := args[1]
+	var chaincodeArgs [][]byte
+	for _, arg := range args[2:] {
+		chaincodeArgs = append(chaincodeArgs, []byte(arg))
+	}
+
+	for i := 0; i < num; i++ {
+		res := stub.InvokeChaincode(chaincodeName, chaincodeArgs, "")
+		if res.GetStatus() != 200 {
+			msg := fmt.Sprintf("Failed to InvokeChaincode %s: [%d]%s", chaincodeName, res.GetStatus(), res.GetMessage())
+			logger.Error(msg)
+			return shim.Error(msg)
+		}
+	}
+
+	return shim.Success(nil)
+}
+
+func (ccperf *CCPerf) runHash(stub shim.ChaincodeStubInterface, args []string) pb.Response {
 	if len(args) != 2 {
 		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 2, received %d", len(args))
 		logger.Error(msg)
@@ -484,21 +518,18 @@ func (ccperf *CCPerf) runInvokeChaincode(stub shim.ChaincodeStubInterface, args 
 		return shim.Error(err.Error())
 	}
 
-	chaincodeName := args[1]
+	key := args[1]
+	hash := []byte(key)
+
+	for i := 0; i < num; i++ {
+		h := sha256.Sum256(hash)
+		copy(hash, h[:])
+	}
+
+	err = stub.PutState(key, hash)
 	if err != nil {
 		logger.Error(err.Error())
 		return shim.Error(err.Error())
-	}
-
-	chaincodeArgs := [][]byte{[]byte("empty")}
-
-	for i := 0; i < num; i++ {
-		res := stub.InvokeChaincode(chaincodeName, chaincodeArgs, "")
-		if res.GetStatus() != 200 {
-			msg := fmt.Sprintf("Failed to InvokeChaincode: %s", res.GetMessage())
-			logger.Error(msg)
-			return shim.Error(msg)
-		}
 	}
 
 	return shim.Success(nil)
