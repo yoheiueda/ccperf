@@ -360,19 +360,19 @@ func (ccperf *CCPerf) runRangeQueryUpdate(stub shim.ChaincodeStubInterface, args
 }
 
 func (ccperf *CCPerf) runMix(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 4 {
-		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
+	if len(args) != 5 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 5, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
 
-	getArgs := []string{args[0], args[3], args[2]}
+	getArgs := []string{args[0], args[4], args[3]}
 	res := ccperf.runGetState(stub, getArgs)
 	if res.GetStatus() != 200 {
 		return res
 	}
 
-	putArgs := []string{args[0], args[1], args[2]}
+	putArgs := []string{args[1], args[2], args[3]}
 	return ccperf.runPutState(stub, putArgs)
 }
 
@@ -390,8 +390,8 @@ type jsonDataType struct {
 }
 
 func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) pb.Response {
-	if len(args) != 4 {
-		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 4, received %d", len(args))
+	if len(args) != 5 {
+		msg := fmt.Sprintf("Incorrect number of arguments. Expecting 5, received %d", len(args))
 		logger.Error(msg)
 		return shim.Error(msg)
 	}
@@ -433,13 +433,13 @@ func (ccperf *CCPerf) runJSON(stub shim.ChaincodeStubInterface, args []string) p
 		}
 	}
 
-	getArgs := []string{args[0], args[3], args[2]}
+	getArgs := []string{args[0], args[4], args[3]}
 	res := ccperf.runGetState(stub, getArgs)
 	if res.GetStatus() != 200 {
 		return res
 	}
 
-	putArgs := []string{args[0], args[1], args[2]}
+	putArgs := []string{args[1], args[2], args[3]}
 	return ccperf.runPutState(stub, putArgs)
 }
 

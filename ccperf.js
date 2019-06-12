@@ -816,8 +816,8 @@ class DefaultChaincodeTxPlugin {
             'getstate': context => [String(context.config.num), String(context.config.population), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index)],
             'rangequery': context => [String(1), String(context.config.population)],
             'rangequeryupdate': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
-            'mix': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
-            'json': context => [String(context.config.num), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
+            'mix': context => [String(context.config.num), String(context.config.num2), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
+            'json': context => [String(context.config.num), String(context.config.num2), String(context.config.size), util.format('key_mychannel_org1_0_%d_%d', context.workerID, context.index), String(context.config.population)],
             'contended': context => randomIntArgs(context.config.num, 0, context.config.population - 1),
         }
     }
@@ -1231,6 +1231,8 @@ function run(cmd) {
         rampdown: 5,
         remotes: remotes
     };
+    config.num2 = cmd.num2 === undefined ? config.num : Number(cmd.num2);
+
     //console.log('config=%j', config);
     const master = new Master(config);
 
@@ -1294,6 +1296,7 @@ function main() {
         .option('--org [string]', "Organization name")
         .option('--type [string]', "Type of workload (eg. putstate)")
         .option('--num [number]', "Number of operations per transaction")
+        .option('--num2 [number]', "Second num parameter")
         .option('--size [bytes]', "Payload size of a PutState call")
         .option('--population [number]', "Number of prepopulated key-values")
         .option('--tx-plugin [plugin]', "JavaScript file that defines transaction handler")
