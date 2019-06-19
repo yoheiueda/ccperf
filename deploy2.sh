@@ -14,7 +14,7 @@ peers=$(jq --arg channel "$channel" -r '.channels[$channel].peers | keys_unsorte
 
 ./peer.sh lifecycle chaincode package "$pkgname" --path "$path" --lang golang --label "$label"
 
-if false; then
+if true; then
 for peer in $peers; do
     org=$(jq --arg peer $peer -r '.organizations | to_entries[] | select(.value.peers[] | . == $peer).key' connection-profile.json)
     mspid=$(jq --arg org $org -r '.organizations[$org] | .mspid' connection-profile.json)
@@ -29,7 +29,7 @@ else
     ./peer.sh lifecycle chaincode install --connectionProfile "$profile" "$pkgname"
 fi
 
-pkgid=$(./peer.sh lifecycle chaincode queryinstalled | awk "/Label: $label\$/"' { print(gensub(/Package ID: (.*),.*$/,"\\1", 1))}')
+pkgid=$(./peer.sh lifecycle chaincode queryinstalled | awk "/Label: $label\$/"' { sub(/Package ID: /, ""); sub(/,.*$/,""); print}')
 
 orderer=$(jq --arg channel "$channel" -r '.channels[$channel].orderers[0]' connection-profile.json)
 endpoint=$(jq --arg orderer $orderer -r '.orderers[$orderer].url | sub("grpc.?://";"")' connection-profile.json)
