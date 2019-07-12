@@ -1,3 +1,13 @@
+commit c1000ac048a5bead6e18f8e4b92bacb724e0c073
+Author: Yohei Ueda <yohei@jp.ibm.com>
+Date:   Fri Jul 12 15:35:07 2019 +0900
+
+    Add wakeup profile
+    
+    Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
+    Change-Id: I0ef7b31e1d9b8e87f05ca0f7bde3a8457b42149c
+    Signed-off-by: Yohei Ueda <yohei@jp.ibm.com>
+
 diff --git a/api/except.txt b/api/except.txt
 index 637be18135..868574ea78 100644
 --- a/api/except.txt
@@ -384,7 +394,7 @@ index 71ca993cc0..aa53a3bc56 100644
  }
  
 diff --git a/src/runtime/pprof/pprof.go b/src/runtime/pprof/pprof.go
-index 74cdd15cfb..d175440da1 100644
+index 74cdd15cfb..790021534e 100644
 --- a/src/runtime/pprof/pprof.go
 +++ b/src/runtime/pprof/pprof.go
 @@ -105,6 +105,7 @@ import (
@@ -472,14 +482,14 @@ index 74cdd15cfb..d175440da1 100644
  		}
  	}
  
-@@ -923,3 +935,164 @@ func scaleMutexProfile(cnt int64, ns float64) (int64, float64) {
+@@ -923,3 +935,186 @@ func scaleMutexProfile(cnt int64, ns float64) (int64, float64) {
  }
  
  func runtime_cyclesPerSecond() int64
 +
-+func getDummyLocation(b *profileBuilder) uint64 {
-+	dummyAddr := uintptr(0)
-+	dummyName := "<waker>"
++func getDummyLocation(b *profileBuilder, name string, dummyAddr uintptr) uint64 {
++	addr := uintptr(0)
++	dummyName := name
 +
 +	if b.locs[dummyAddr] != 0 {
 +		return uint64(b.locs[dummyAddr])
@@ -490,7 +500,7 @@ index 74cdd15cfb..d175440da1 100644
 +
 +	start := b.pb.startMessage()
 +	b.pb.uint64Opt(tagLocation_ID, dummyID)
-+	b.pb.uint64Opt(tagLocation_Address, uint64(dummyAddr))
++	b.pb.uint64Opt(tagLocation_Address, uint64(addr))
 +	dummyFuncID := uint64(len(b.funcs)) + 1
 +	b.funcs[dummyName] = int(dummyFuncID)
 +	b.pbLine(tagLocation_Line, dummyFuncID, int64(0))
@@ -515,28 +525,16 @@ index 74cdd15cfb..d175440da1 100644
 +
 +	cpuGHz := float64(runtime_cyclesPerSecond()) / 1e9
 +
-+	dummyID := getDummyLocation(b)
++	goLocID := getDummyLocation(b, "<go>", 0)
++	wakerLocID := getDummyLocation(b, "<waker>", 1)
 +
 +	values := []int64{0, 0}
 +	var locs []uint64
 +
 +	for _, r := range records {
-+		//var numWaiterFrames int64
 +		values[0] = r.Count
 +		values[1] = int64(float64(r.Cycles) / cpuGHz)
 +		locs = locs[:0]
-+		for _, addr := range r.Waiter.Stack() {
-+			// For count profiles, all stack addresses are
-+			// return PCs, which is what locForPC expects.
-+			l := b.locForPC(addr)
-+			if l == 0 { // runtime.goexit
-+				continue
-+			}
-+			locs = append(locs, l)
-+			//numWaiterFrames++
-+		}
-+
-+		locs = append(locs, dummyID)
 +
 +		for _, addr := range r.Notifier.Stack() {
 +			// For count profiles, all stack addresses are
@@ -547,8 +545,42 @@ index 74cdd15cfb..d175440da1 100644
 +			}
 +			locs = append(locs, l)
 +		}
++
++		if addr := r.Notifier.Creator; addr != 0 {
++			locs = append(locs, goLocID)
++			l := b.locForPC(addr)
++			locs = append(locs, l)
++		}
++
++		for i, l := range locs {
++			j := len(locs) - i - 1
++			if i >= j {
++				break
++			}
++			locs[i] = locs[j]
++			locs[j] = l
++
++		}
++
++		locs = append(locs, wakerLocID)
++
++		for _, addr := range r.Waiter.Stack() {
++			// For count profiles, all stack addresses are
++			// return PCs, which is what locForPC expects.
++			l := b.locForPC(addr)
++			if l == 0 { // runtime.goexit
++				continue
++			}
++			locs = append(locs, l)
++		}
++
++		if addr := r.Waiter.Creator; addr != 0 {
++			locs = append(locs, goLocID)
++			l := b.locForPC(addr)
++			locs = append(locs, l)
++		}
++
 +		b.pbSample(values, locs, func() {
-+			//b.pbLabel(tagSample_Label, "waiterFrames", "", numWaiterFrames)
 +			b.pbLabel(tagSample_Label, "eventType", r.Event, 0)
 +		})
 +	}
